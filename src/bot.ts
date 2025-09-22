@@ -36,7 +36,7 @@ bot.start(async (ctx) => {
       chatId: ctx.chat.id,
       menuButton: {
         type: "web_app",
-        text: "Market",
+        text: "APP",
         web_app: { url: webAppUrl },
       },
     });
@@ -146,7 +146,7 @@ bot.on("web_app_data", async (ctx) => {
     await bot.telegram.setChatMenuButton({
       menuButton: {
         type: "web_app",
-        text: "Market",
+        text: "APP",
         web_app: { url: webAppUrl },
       },
     });

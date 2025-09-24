@@ -22,7 +22,7 @@ const bot = new Telegraf(token);
    ───────────────────────────────────────────────────────────── */
 bot.start(async (ctx) => {
   // Inline button — this is what produces the “Open” pill in many clients
-  await ctx.reply("🚀 Ready to launch Mini App!", {
+  await ctx.reply("🚀 Start the flywheel", {
     reply_markup: {
       inline_keyboard: [
         [{ text: "Open Mini App", web_app: { url: webAppUrl } }],

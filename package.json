@@ -6,7 +6,9 @@
   "scripts": {
     "build": "tsc",
     "start:bot": "node dist/bot.js",
+    "start:admin": "node dist/adminBot.js",
     "dev:bot": "ts-node src/bot.ts",
+    "dev:admin": "ts-node src/adminBot.ts",
     "watch": "tsc --watch"
   },
   "dependencies": {

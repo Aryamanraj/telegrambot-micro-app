@@ -2,6 +2,7 @@ import { promises as fs } from "fs";
 import path from "path";
 import dotenv from "dotenv";
 import { Telegraf } from "telegraf";
+import BigNumber from "bignumber.js";
 
 dotenv.config();
 
@@ -21,6 +22,7 @@ interface CapSummary {
   txHash: string;
   fromWalletAddress: string;
   toWalletAddress: string;
+  giftId: number;
 }
 
 interface PollResponse {
@@ -80,12 +82,16 @@ const subscribedChats = new Set(staticChatIds);
 
 type CapState = "PARTIAL_PUBLISHED" | "PUBLISHED" | "APPROVED" | "REJECTED";
 
+type ApiRecord = Record<string, unknown>;
+
 interface StoredCap {
   item: CapSummary;
   state: CapState;
   publishedChatIds: number[];
   messageIds: { [chatId: number]: number };
   isEdited: boolean;
+  buyTransactionRecord: ApiRecord | null;
+  capStrRecord: ApiRecord | null;
 }
 
 const announcedCaps = new Map<string, StoredCap>();
@@ -175,8 +181,10 @@ async function loadAnnouncedAddresses(): Promise<void> {
     const parsed = JSON.parse(raw) as { caps?: StoredCap[] };
     if (Array.isArray(parsed.caps)) {
       parsed.caps.forEach((stored) => {
-        stored.messageIds = {};
+        stored.messageIds = stored.messageIds ?? {};
         stored.isEdited = stored.isEdited || false;
+        stored.buyTransactionRecord = stored.buyTransactionRecord ?? null;
+        stored.capStrRecord = stored.capStrRecord ?? null;
         announcedCaps.set(stored.item.offchainGetgemsAddress, stored);
       });
     }
@@ -233,6 +241,84 @@ async function appendRawCaps(caps: CapSummary[]): Promise<void> {
   }
 }
 
+function normalizeIdentifier(value: unknown): string | number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.length > 0) {
+      return trimmed;
+    }
+  }
+  return null;
+}
+
+async function postJson(url: string, body: unknown): Promise<ApiRecord> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      "x-api-key": pollApiKey,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`POST ${url} failed with HTTP ${response.status}: ${text}`);
+  }
+
+  try {
+    return (await response.json()) as ApiRecord;
+  } catch (error) {
+    throw new Error(`Failed to parse JSON response from ${url}`);
+  }
+}
+
+async function createTransactionRecord(cap: CapSummary): Promise<ApiRecord> {
+  const payload = {
+    txHash: cap.txHash,
+    fromWalletAddress: cap.fromWalletAddress,
+    toWalletAddress: cap.toWalletAddress,
+    giftId: cap.giftId ?? 0,
+    currency: "TON",
+    amount:
+      new BigNumber(cap.buyPriceTon).multipliedBy(10 ** 9).toString() ??
+      new BigNumber(0).toString(),
+    txType: "BUY",
+    timeStamp: cap.buyTime,
+  };
+
+  console.log(
+    `Creating transaction record for cap ${cap.offchainGetgemsAddress}`
+  );
+  return postJson(`${backendBaseUrl}/capStr/transactions`, payload);
+}
+
+async function createCapRecord(
+  cap: CapSummary,
+  state: CapState,
+  buyTransactionId: string | number
+): Promise<ApiRecord> {
+  const payload = {
+    giftId: cap.giftId,
+    url: cap.getGemsUrl,
+    boughtFor: new BigNumber(cap.buyPriceTon).multipliedBy(10 ** 9).toString(),
+    listedFor: new BigNumber(cap.salePriceTon).multipliedBy(10 ** 9).toString(),
+    capStrCapState: "LISTED",
+    buyDate: cap.buyTime,
+    sellDate: null,
+    buyTransactionId,
+  };
+
+  console.log(
+    `Creating cap record for cap ${cap.offchainGetgemsAddress} using transaction ${buyTransactionId}`
+  );
+  return postJson(`${backendBaseUrl}/capStr/caps`, payload);
+}
+
 async function pollOnce(): Promise<void> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15_000);
@@ -285,6 +371,8 @@ async function pollOnce(): Promise<void> {
         publishedChatIds: Array.from(subscribedChats),
         messageIds: {},
         isEdited: false,
+        buyTransactionRecord: null,
+        capStrRecord: null,
       };
       announcedCaps.set(cap.offchainGetgemsAddress, stored);
       const message = buildAlertMessage(cap, stored.state, stored.isEdited);
@@ -340,16 +428,21 @@ function buildAlertMessage(
     .replace("T", " ")
     .replace(/\.\d{3}Z$/, " UTC");
   let heading = "<b>🚨 New Cap Detected</b>";
+  const headerLines: string[] = [];
   if (state === "APPROVED") {
-    heading = "<b>✅ Approved Cap</b>";
+    heading = "<b>✅ Cap Published</b>";
+    headerLines.push(
+      '<b>Live at:</b> <a href="https://capstrategy.fun">capstrategy.fun</a>'
+    );
   } else if (state === "REJECTED") {
     heading = "<b>⛔ Rejected Cap</b>";
   } else if (isEdited) {
     heading = "<b>✏️ Edited Cap</b>";
   }
-  return [
-    heading,
-    "",
+
+  const lines: string[] = [heading, ...headerLines, ""];
+
+  lines.push(
     `<b>Getgems Address:</b> <code>${cap.offchainGetgemsAddress}</code>`,
     `<b>Name:</b> ${cap.name ?? "N/A"}`,
     "",
@@ -371,8 +464,10 @@ function buildAlertMessage(
     )}</code>`,
     `<b>Buyer Wallet:</b> <code>${knownAddressFormatter(
       cap.toWalletAddress
-    )}</code>`,
-  ].join("\n");
+    )}</code>`
+  );
+
+  return lines.join("\n");
 }
 
 async function broadcastMessage(
@@ -419,7 +514,9 @@ bot.on("callback_query", async (ctx) => {
 
     const infoMessage = await ctx.telegram.sendMessage(
       chatId,
-      `<b>Editing:</b> ${stored.item.name ?? "N/A"}\n<code>${stored.item.offchainGetgemsAddress}</code>`,
+      `<b>Editing:</b> ${stored.item.name ?? "N/A"}\n<code>${
+        stored.item.offchainGetgemsAddress
+      }</code>`,
       { parse_mode: "HTML" }
     );
 
@@ -467,8 +564,14 @@ bot.on("callback_query", async (ctx) => {
     await ctx.answerCbQuery();
   } else if (data.startsWith("approve_")) {
     const address = data.slice(8);
-    await approveCap(address);
-    await ctx.answerCbQuery("Approved");
+    try {
+      await approveCap(address);
+      await ctx.answerCbQuery("Approved");
+    } catch (error) {
+      console.error(`Approval flow failed for ${address}`, error);
+      await ctx.answerCbQuery("Approval failed");
+      await ctx.reply("Failed to approve cap. Check logs for details.");
+    }
   } else if (data.startsWith("reject_")) {
     const address = data.slice(7);
     await rejectCap(address);
@@ -529,7 +632,11 @@ bot.on("text", async (ctx, next) => {
           console.error(`Failed to edit message in chat ${chid}`, error);
         }
       }
-      for (const messageId of [promptMessageId, selectMessageId, infoMessageId]) {
+      for (const messageId of [
+        promptMessageId,
+        selectMessageId,
+        infoMessageId,
+      ]) {
         try {
           await ctx.telegram.deleteMessage(chatId, messageId);
         } catch (error) {
@@ -568,7 +675,9 @@ bot.command("unsubscribe", async (ctx) => {
     return;
   }
   subscribedChats.delete(chatId);
-  await ctx.reply("Subscription removed. This chat will stop receiving cap alerts.");
+  await ctx.reply(
+    "Subscription removed. This chat will stop receiving cap alerts."
+  );
 });
 
 bot.command("pulldata", async (ctx) => {
@@ -599,28 +708,61 @@ async function editCap(address: string) {
 
 async function approveCap(address: string) {
   const stored = announcedCaps.get(address);
-  if (stored) {
-    stored.state = "APPROVED";
+  if (!stored) {
+    throw new Error(`Cap ${address} not found for approval`);
+  }
+
+  const cap = stored.item;
+
+  if (!stored.buyTransactionRecord) {
+    stored.buyTransactionRecord = await createTransactionRecord(cap);
     await persistAnnouncedAddresses();
-    const message = buildAlertMessage(stored.item, stored.state, stored.isEdited);
-    for (const [chatId, messageId] of Object.entries(stored.messageIds)) {
-      try {
-        await bot.telegram.editMessageText(
-          Number(chatId),
-          Number(messageId),
-          undefined,
-          message,
-          {
-            parse_mode: "HTML",
-            reply_markup: { inline_keyboard: [] },
-          }
-        );
-      } catch (error) {
-        console.error(`Failed to update approved message in chat ${chatId}`, error);
-      }
+  }
+
+  const buyTransactionId = (stored.buyTransactionRecord as any).data
+    ?.TxID as number;
+
+  if (buyTransactionId === null) {
+    console.error(
+      "Transaction response missing identifier:",
+      JSON.stringify(stored.buyTransactionRecord)
+    );
+    throw new Error(
+      `Transaction record for ${cap.offchainGetgemsAddress} missing identifier`
+    );
+  }
+
+  if (!stored.capStrRecord) {
+    stored.capStrRecord = await createCapRecord(
+      cap,
+      "APPROVED",
+      buyTransactionId
+    );
+    await persistAnnouncedAddresses();
+  }
+
+  stored.state = "APPROVED";
+  await persistAnnouncedAddresses();
+  const message = buildAlertMessage(stored.item, stored.state, stored.isEdited);
+  for (const [chatId, messageId] of Object.entries(stored.messageIds)) {
+    try {
+      await bot.telegram.editMessageText(
+        Number(chatId),
+        Number(messageId),
+        undefined,
+        message,
+        {
+          parse_mode: "HTML",
+          reply_markup: { inline_keyboard: [] },
+        }
+      );
+    } catch (error) {
+      console.error(
+        `Failed to update approved message in chat ${chatId}`,
+        error
+      );
     }
   }
-  // TODO: implement approve logic
 }
 
 async function rejectCap(address: string) {
@@ -628,7 +770,11 @@ async function rejectCap(address: string) {
   if (stored) {
     stored.state = "REJECTED";
     await persistAnnouncedAddresses();
-    const message = buildAlertMessage(stored.item, stored.state, stored.isEdited);
+    const message = buildAlertMessage(
+      stored.item,
+      stored.state,
+      stored.isEdited
+    );
     for (const [chatId, messageId] of Object.entries(stored.messageIds)) {
       try {
         await bot.telegram.editMessageText(
@@ -642,7 +788,10 @@ async function rejectCap(address: string) {
           }
         );
       } catch (error) {
-        console.error(`Failed to update rejected message in chat ${chatId}`, error);
+        console.error(
+          `Failed to update rejected message in chat ${chatId}`,
+          error
+        );
       }
     }
   }
@@ -695,7 +844,10 @@ function stopPolling(): void {
   await bot.telegram.setMyCommands([
     { command: "pulldata", description: "Trigger manual poll of new caps" },
     { command: "subscribe", description: "Subscribe this chat to cap alerts" },
-    { command: "unsubscribe", description: "Unsubscribe this chat from cap alerts" },
+    {
+      command: "unsubscribe",
+      description: "Unsubscribe this chat from cap alerts",
+    },
   ]);
 
   startPolling();

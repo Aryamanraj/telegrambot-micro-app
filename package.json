@@ -12,6 +12,7 @@
     "watch": "tsc --watch"
   },
   "dependencies": {
+    "bignumber.js": "^9.3.1",
     "dotenv": "^16.3.1",
     "telegraf": "^4.15.6"
   },

@@ -5,39 +5,38 @@ import { Telegraf } from "telegraf";
 
 dotenv.config();
 
-type ChatId = number;
-
 interface CapSummary {
-  readonly address: string;
-  readonly name: string;
-  readonly capNumber: number;
-  readonly collectionAddress: string;
-  readonly image: string;
-  readonly saleType: string;
-  readonly salePriceTon: string;
-  readonly detectedAt: number;
-  readonly saleTime: number;
-  readonly getGemsUrl: string;
-  readonly txHash: string;
-  readonly fromWalletAddress: string;
-  readonly toWalletAddress: string;
+  onchainAddress: string | null;
+  offchainGetgemsAddress: string;
+  name: string;
+  capNumber: number;
+  collectionAddress: string;
+  image: string;
+  saleType: string;
+  salePriceTon: string;
+  buyPriceTon: string;
+  detectedAt: number;
+  buyTime: number;
+  getGemsUrl: string;
+  txHash: string;
+  fromWalletAddress: string;
+  toWalletAddress: string;
 }
 
 interface PollResponse {
   readonly success: boolean;
-  readonly message: string;
-  readonly data?: {
-    readonly ownerAddress: string;
-    readonly totalCaps: number;
-    readonly hasNew: boolean;
-    readonly newCaps: CapSummary[];
-    readonly seenCaps?: string[];
-    readonly polledAt: number;
+  message: string;
+  data?: {
+    ownerAddress: string;
+    totalCaps: number;
+    hasNew: boolean;
+    newCaps: CapSummary[];
+    seenCaps: string[];
+    polledAt: number;
   };
 }
 
-const botToken =
-  process.env.ADMIN_TG_BOT_TOKEN ?? process.env.TGMARKETPLACE_TEST_BOT_TOKEN;
+const botToken = process.env.STRATEGY_APPS_ADMIN_BOT_TOKEN;
 if (!botToken) {
   throw new Error("ADMIN_TG_BOT_TOKEN not set in environment");
 }
@@ -50,7 +49,7 @@ if (!rawPollApiKey) {
 const pollApiKey = rawPollApiKey;
 
 const pollIntervalMs = (() => {
-  const fallback = 6000;
+  const fallback = 60_000;
   const raw = process.env.ADMIN_POLL_INTERVAL_MS;
   if (!raw) return fallback;
   const parsed = Number(raw);
@@ -65,63 +64,174 @@ const pollIntervalMs = (() => {
 
 const bot = new Telegraf(botToken);
 
-const subscribedChats = new Set<ChatId>();
-const announcedCapAddresses = new Set<string>();
-
-const dataDir =
-  process.env.ADMIN_DATA_DIR ?? path.resolve(process.cwd(), "data");
-const subscriptionsFilePath = path.join(dataDir, "subscriptions.json");
-
 const staticChatIds = (process.env.ADMIN_POLL_CHAT_IDS ?? "")
   .split(",")
   .map((part) => part.trim())
   .filter((part) => part.length > 0)
   .map((part) => Number(part))
   .filter((id) => Number.isInteger(id));
-staticChatIds.forEach((id) => subscribedChats.add(id));
 
-async function loadStoredChatIds(): Promise<void> {
+if (staticChatIds.length === 0) {
+  throw new Error("ADMIN_POLL_CHAT_IDS not set or empty in environment");
+}
+
+const allowedChatIds = new Set(staticChatIds);
+const subscribedChats = new Set(staticChatIds);
+
+type CapState = "PARTIAL_PUBLISHED" | "PUBLISHED" | "APPROVED" | "REJECTED";
+
+interface StoredCap {
+  item: CapSummary;
+  state: CapState;
+  publishedChatIds: number[];
+  messageIds: { [chatId: number]: number };
+  isEdited: boolean;
+}
+
+const announcedCaps = new Map<string, StoredCap>();
+
+const dataDir =
+  process.env.ADMIN_DATA_DIR ?? path.resolve(process.cwd(), "data");
+const announcedFilePath = path.join(dataDir, "announced.json");
+const rawLogFilePath = path.join(dataDir, "raw-caps-log.json");
+
+const editableFields = [
+  "Getgems Address",
+  "Name",
+  "Record Type",
+  "Buy Price",
+  "Sale Price",
+  "Buy Time (UTC)",
+  "GetGems URL",
+  "Link to Gift",
+  "Tx Hash",
+  "Seller Wallet",
+  "Buyer Wallet",
+];
+
+const fieldToProperty: { [key: string]: string } = {
+  "Getgems Address": "offchainGetgemsAddress",
+  Name: "name",
+  "Record Type": "saleType",
+  "Buy Price": "buyPriceTon",
+  "Sale Price": "salePriceTon",
+  "Buy Time (UTC)": "buyTime",
+  "GetGems URL": "getGemsUrl",
+  "Link to Gift": "onchainAddress",
+  "Tx Hash": "txHash",
+  "Seller Wallet": "fromWalletAddress",
+  "Buyer Wallet": "toWalletAddress",
+};
+
+interface RawCapLogEntry {
+  receivedAt: number;
+  cap: CapSummary;
+}
+
+function buildActionKeyboard(capAddress: string) {
+  return {
+    inline_keyboard: [
+      [
+        { text: "Approve", callback_data: `approve_${capAddress}` },
+        { text: "Edit", callback_data: `edit_${capAddress}` },
+        { text: "Reject", callback_data: `reject_${capAddress}` },
+      ],
+    ],
+  };
+}
+
+function buildFieldSelectionKeyboard() {
+  const keyboard: { text: string; callback_data: string }[][] = [];
+  for (let i = 0; i < editableFields.length; i += 3) {
+    const row: { text: string; callback_data: string }[] = [];
+    for (let j = i; j < Math.min(i + 3, editableFields.length); j += 1) {
+      row.push({ text: editableFields[j], callback_data: `select_field_${j}` });
+    }
+    keyboard.push(row);
+  }
+  return keyboard;
+}
+
+const editState = new Map<
+  number,
+  {
+    capAddress: string;
+    field: string;
+    promptMessageId: number;
+    chatId: number;
+    selectMessageId: number;
+    infoMessageId: number;
+  }
+>();
+
+const fieldSelectState = new Map<
+  number,
+  { address: string; selectMessageId: number; infoMessageId: number }
+>(); // chatId to selection metadata
+
+async function loadAnnouncedAddresses(): Promise<void> {
   try {
-    const raw = await fs.readFile(subscriptionsFilePath, "utf8");
-    const parsed = JSON.parse(raw) as { chatIds?: unknown };
-    if (Array.isArray(parsed.chatIds)) {
-      parsed.chatIds
-        .map((value) => Number(value))
-        .filter((value) => Number.isInteger(value))
-        .forEach((id) => subscribedChats.add(id));
+    const raw = await fs.readFile(announcedFilePath, "utf8");
+    const parsed = JSON.parse(raw) as { caps?: StoredCap[] };
+    if (Array.isArray(parsed.caps)) {
+      parsed.caps.forEach((stored) => {
+        stored.messageIds = {};
+        stored.isEdited = stored.isEdited || false;
+        announcedCaps.set(stored.item.offchainGetgemsAddress, stored);
+      });
     }
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return;
-    console.error("Failed to load stored chat IDs", error);
+    console.error("Failed to load announced caps", error);
   }
 }
 
-async function persistSubscriptions(): Promise<void> {
+async function persistAnnouncedAddresses(): Promise<void> {
   try {
     await fs.mkdir(dataDir, { recursive: true });
     const payload = JSON.stringify(
-      { chatIds: Array.from(subscribedChats) },
+      { caps: Array.from(announcedCaps.values()) },
       null,
       2
     );
-    await fs.writeFile(subscriptionsFilePath, payload, "utf8");
+    await fs.writeFile(announcedFilePath, payload, "utf8");
   } catch (error) {
-    console.error("Failed to persist chat IDs", error);
+    console.error("Failed to persist announced caps", error);
   }
 }
 
-function addChatId(id: ChatId): boolean {
-  if (subscribedChats.has(id)) return false;
-  subscribedChats.add(id);
-  return true;
-}
+async function appendRawCaps(caps: CapSummary[]): Promise<void> {
+  if (caps.length === 0) return;
+  try {
+    await fs.mkdir(dataDir, { recursive: true });
+    let entries: RawCapLogEntry[] = [];
+    try {
+      const raw = await fs.readFile(rawLogFilePath, "utf8");
+      const parsed = JSON.parse(raw) as { entries?: RawCapLogEntry[] };
+      if (Array.isArray(parsed.entries)) {
+        entries = parsed.entries;
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") {
+        console.error("Failed to read raw caps log", error);
+      }
+    }
 
-function removeChatId(id: ChatId): boolean {
-  return subscribedChats.delete(id);
-}
+    const receivedAt = Date.now();
+    const newEntries = caps.map((cap) => ({
+      receivedAt,
+      cap: JSON.parse(JSON.stringify(cap)) as CapSummary,
+    }));
+    entries.push(...newEntries);
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const payload = JSON.stringify({ entries }, null, 2);
+    await fs.writeFile(rawLogFilePath, payload, "utf8");
+  } catch (error) {
+    console.error("Failed to append raw caps", error);
+  }
+}
 
 async function pollOnce(): Promise<void> {
   const controller = new AbortController();
@@ -153,25 +263,35 @@ async function pollOnce(): Promise<void> {
     console.log(
       `Polled at ${new Date(data.polledAt).toISOString()}: totalCaps=${
         data.totalCaps
-      }, newCaps=${data.newCaps.length}`
+      }, hasNew=${data.hasNew}, newCaps=${data.newCaps.length}`
     );
-
-    data.seenCaps?.forEach((address) => announcedCapAddresses.add(address));
 
     if (!data.hasNew || data.newCaps.length === 0) {
       return;
     }
 
     const freshCaps = data.newCaps.filter(
-      (cap) => !announcedCapAddresses.has(cap.address)
+      (cap) => !announcedCaps.has(cap.offchainGetgemsAddress)
     );
 
     if (freshCaps.length === 0) return;
 
-    const message = buildAlertMessage(data.ownerAddress, freshCaps);
-    await broadcastMessage(message);
+    await appendRawCaps(freshCaps);
 
-    freshCaps.forEach((cap) => announcedCapAddresses.add(cap.address));
+    for (const cap of freshCaps) {
+      const stored: StoredCap = {
+        item: cap,
+        state: "PUBLISHED",
+        publishedChatIds: Array.from(subscribedChats),
+        messageIds: {},
+        isEdited: false,
+      };
+      announcedCaps.set(cap.offchainGetgemsAddress, stored);
+      const message = buildAlertMessage(cap, stored.state, stored.isEdited);
+      await broadcastMessage(message, cap.offchainGetgemsAddress);
+    }
+
+    await persistAnnouncedAddresses();
   } catch (error) {
     if ((error as Error).name === "AbortError") {
       console.error("Poll request timed out");
@@ -184,114 +304,401 @@ async function pollOnce(): Promise<void> {
   }
 }
 
-function buildAlertMessage(ownerAddress: string, caps: CapSummary[]): string {
-  const header =
-    caps.length === 1
-      ? "Cap alert: 1 new cap detected"
-      : `Cap alert: ${caps.length} new caps detected`;
+function saleTypeFormatter(saleType: string): string {
+  switch (saleType.toLowerCase()) {
+    case "auction":
+      return "Auction";
+    case "nftsalefixprice":
+    case "fixpricesale":
+      return "Sale";
+    case "putupforsale":
+      return "Listed";
+    case "transfer":
+      return "Transferred";
+    default:
+      return saleType;
+  }
+}
 
-  const lines = caps.map((cap, index) => {
-    const saleDate = new Date(cap.saleTime).toISOString();
-    return [
-      `${index + 1}. ${cap.name} (#${cap.capNumber})`,
-      `   Sale type: ${cap.saleType}`,
-      `   Price: ${cap.salePriceTon} TON`,
-      `   Sale time: ${saleDate}`,
-      `   Link: ${cap.getGemsUrl}`,
-    ].join("\n");
-  });
+function knownAddressFormatter(address: string): string {
+  if (
+    address === "EQDp00TOpFDpJ0IvBgIn6rOUiCQeNZQSAPzI7kNPT65pjyr2" ||
+    address === "UQDp00TOpFDpJ0IvBgIn6rOUiCQeNZQSAPzI7kNPT65pj3cz"
+  ) {
+    return "capstrategy.ton";
+  }
+  return address;
+}
 
+function buildAlertMessage(
+  cap: CapSummary,
+  state: CapState,
+  isEdited: boolean = false
+): string {
+  const saleDate = new Date(cap.buyTime)
+    .toISOString()
+    .replace("T", " ")
+    .replace(/\.\d{3}Z$/, " UTC");
+  let heading = "<b>🚨 New Cap Detected</b>";
+  if (state === "APPROVED") {
+    heading = "<b>✅ Approved Cap</b>";
+  } else if (state === "REJECTED") {
+    heading = "<b>⛔ Rejected Cap</b>";
+  } else if (isEdited) {
+    heading = "<b>✏️ Edited Cap</b>";
+  }
   return [
-    header,
-    `Owner: ${ownerAddress}`,
+    heading,
     "",
-    ...lines,
+    `<b>Getgems Address:</b> <code>${cap.offchainGetgemsAddress}</code>`,
+    `<b>Name:</b> ${cap.name ?? "N/A"}`,
     "",
-    "Reply with /unsubscribe to stop these alerts.",
+    `<b>Record Type:</b> ${saleTypeFormatter(cap.saleType) ?? "N/A"}`,
+    `<b>Buy Price:</b> ${cap.buyPriceTon ?? "N/A"} TON`,
+    `<b>Sale Price:</b> ${cap.salePriceTon ?? "N/A"} TON`,
+    "",
+    `<b>Buy Time (UTC):</b> ${saleDate} (${cap.buyTime / 1000})`,
+    `<b>GetGems URL:</b> <a href="${cap.getGemsUrl}">View on GetGems</a>`,
+    `<b>Link to Gift:</b> ${
+      cap.onchainAddress
+        ? `<a href="https://tonviewer.com/${cap.onchainAddress}">View on Tonviewer</a>`
+        : "Offchain Gift"
+    }`,
+    "",
+    `<b>Tx Hash:</b> <code>${cap.txHash}</code>`,
+    `<b>Seller Wallet:</b> <code>${knownAddressFormatter(
+      cap.fromWalletAddress
+    )}</code>`,
+    `<b>Buyer Wallet:</b> <code>${knownAddressFormatter(
+      cap.toWalletAddress
+    )}</code>`,
   ].join("\n");
 }
 
-async function broadcastMessage(message: string): Promise<void> {
+async function broadcastMessage(
+  message: string,
+  capAddress: string
+): Promise<void> {
   if (subscribedChats.size === 0) {
     console.warn("No chat subscriptions available; message skipped");
     return;
   }
 
-  await Promise.all(
-    Array.from(subscribedChats).map(async (chatId) => {
-      try {
-        await bot.telegram.sendMessage(chatId, message);
-      } catch (error) {
-        console.error(`Failed to deliver alert to chat ${chatId}`, error);
+  console.log("Broadcasting alert to chats:", Array.from(subscribedChats));
+  for (const chatId of subscribedChats) {
+    try {
+      const result = await bot.telegram.sendMessage(chatId, message, {
+        parse_mode: "HTML",
+        reply_markup: buildActionKeyboard(capAddress),
+      });
+      const stored = announcedCaps.get(capAddress);
+      if (stored) {
+        stored.messageIds[chatId] = result.message_id;
       }
-    })
-  );
+      console.log(`Alert sent to chat ${chatId} for cap ${capAddress}`);
+    } catch (error) {
+      console.error(`Failed to deliver alert to chat ${chatId}`, error);
+    }
+  }
 }
 
-bot.start(async (ctx) => {
-  const changed = addChatId(ctx.chat.id);
-  if (changed) {
-    await persistSubscriptions();
+bot.on("callback_query", async (ctx) => {
+  const data = (ctx.callbackQuery as any).data;
+  if (data.startsWith("edit_") && !data.startsWith("edit_field_")) {
+    const address = data.slice(5);
+    const stored = announcedCaps.get(address);
+    if (!stored) {
+      await ctx.answerCbQuery("Cap not found");
+      return;
+    }
+    const chatId = ctx.chat!.id;
+    const originMessageId = ctx.callbackQuery.message?.message_id;
+    if (originMessageId) {
+      stored.messageIds[chatId] = originMessageId;
+    }
+
+    const infoMessage = await ctx.telegram.sendMessage(
+      chatId,
+      `<b>Editing:</b> ${stored.item.name ?? "N/A"}\n<code>${stored.item.offchainGetgemsAddress}</code>`,
+      { parse_mode: "HTML" }
+    );
+
+    const selectionMessage = await ctx.telegram.sendMessage(
+      chatId,
+      "Select the field to edit:",
+      {
+        reply_markup: { inline_keyboard: buildFieldSelectionKeyboard() },
+      }
+    );
+
+    fieldSelectState.set(chatId, {
+      address,
+      selectMessageId: selectionMessage.message_id,
+      infoMessageId: infoMessage.message_id,
+    });
+    await ctx.answerCbQuery();
+  } else if (data.startsWith("select_field_")) {
+    const index = Number(data.slice(13));
+    const chatId = ctx.chat!.id;
+    const state = fieldSelectState.get(chatId);
+    if (!state) {
+      await ctx.answerCbQuery("Session expired");
+      return;
+    }
+    const { address, selectMessageId, infoMessageId } = state;
+    const field = editableFields[index];
+    if (!field) {
+      await ctx.answerCbQuery("Invalid field");
+      return;
+    }
+    const promptMsg = await ctx.telegram.sendMessage(
+      chatId,
+      `Please enter the new value for ${field}:`
+    );
+    editState.set(ctx.from!.id, {
+      capAddress: address,
+      field,
+      promptMessageId: promptMsg.message_id,
+      chatId,
+      selectMessageId,
+      infoMessageId,
+    });
+    fieldSelectState.delete(chatId);
+    await ctx.answerCbQuery();
+  } else if (data.startsWith("approve_")) {
+    const address = data.slice(8);
+    await approveCap(address);
+    await ctx.answerCbQuery("Approved");
+  } else if (data.startsWith("reject_")) {
+    const address = data.slice(7);
+    await rejectCap(address);
+    await ctx.answerCbQuery("Rejected");
   }
-  await ctx.reply(
-    "Subscribed to cap alerts. Use /unsubscribe to stop notifications."
-  );
+});
+
+bot.on("text", async (ctx, next) => {
+  const userId = ctx.from!.id;
+  const state = editState.get(userId);
+  if (state) {
+    const {
+      capAddress,
+      field,
+      promptMessageId,
+      chatId,
+      selectMessageId,
+      infoMessageId,
+    } = state;
+    const newValue = ctx.message!.text!;
+    const stored = announcedCaps.get(capAddress);
+    if (stored) {
+      const prop = fieldToProperty[field];
+      if (prop === "buyTime") {
+        const parsed = Number(newValue);
+        if (!isNaN(parsed)) {
+          stored.item.buyTime = parsed;
+        }
+      } else if (prop === "onchainAddress") {
+        stored.item.onchainAddress = newValue || null;
+      } else {
+        (stored.item as any)[prop] = newValue;
+      }
+      stored.isEdited = true;
+      await persistAnnouncedAddresses();
+      const newMessage = buildAlertMessage(
+        stored.item,
+        stored.state,
+        stored.isEdited
+      );
+      const replyMarkup =
+        stored.state === "APPROVED" || stored.state === "REJECTED"
+          ? { inline_keyboard: [] }
+          : buildActionKeyboard(capAddress);
+      for (const [chid, mid] of Object.entries(stored.messageIds)) {
+        try {
+          await ctx.telegram.editMessageText(
+            Number(chid),
+            Number(mid),
+            undefined,
+            newMessage,
+            {
+              parse_mode: "HTML",
+              reply_markup: replyMarkup,
+            }
+          );
+        } catch (error) {
+          console.error(`Failed to edit message in chat ${chid}`, error);
+        }
+      }
+      for (const messageId of [promptMessageId, selectMessageId, infoMessageId]) {
+        try {
+          await ctx.telegram.deleteMessage(chatId, messageId);
+        } catch (error) {
+          console.warn(`Failed to delete helper message ${messageId}`, error);
+        }
+      }
+    }
+    editState.delete(userId);
+    return;
+  }
+  await next();
 });
 
 bot.command("subscribe", async (ctx) => {
-  const changed = addChatId(ctx.chat.id);
-  if (changed) {
-    await persistSubscriptions();
+  const chatId = ctx.chat?.id;
+  if (!chatId || !allowedChatIds.has(chatId)) {
+    await ctx.reply("Chat not authorized to subscribe.");
+    return;
   }
-  await ctx.reply("Subscription confirmed. You'll receive cap alerts here.");
+  if (subscribedChats.has(chatId)) {
+    await ctx.reply("Already subscribed to cap alerts.");
+    return;
+  }
+  subscribedChats.add(chatId);
+  await ctx.reply("Subscription enabled. This chat will receive cap alerts.");
 });
 
 bot.command("unsubscribe", async (ctx) => {
-  const removed = removeChatId(ctx.chat.id);
-  if (removed) {
-    await persistSubscriptions();
+  const chatId = ctx.chat?.id;
+  if (!chatId || !allowedChatIds.has(chatId)) {
+    await ctx.reply("Chat not authorized to unsubscribe.");
+    return;
   }
-  await ctx.reply("Unsubscribed. Send /subscribe anytime to re-enable alerts.");
+  if (!subscribedChats.has(chatId)) {
+    await ctx.reply("This chat is not currently subscribed.");
+    return;
+  }
+  subscribedChats.delete(chatId);
+  await ctx.reply("Subscription removed. This chat will stop receiving cap alerts.");
 });
 
-bot.on("my_chat_member", async (ctx) => {
-  // Automatically subscribe when the bot is added to a group.
-  const status = ctx.myChatMember?.new_chat_member?.status;
-  if (status === "member" || status === "administrator") {
-    const changed = addChatId(ctx.chat.id);
-    if (changed) {
-      await persistSubscriptions();
-    }
-    console.log(`Auto-subscribed chat ${ctx.chat.id} after join event`);
+bot.command("pulldata", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId || !allowedChatIds.has(chatId)) {
+    await ctx.reply("Not authorized for manual polling.");
+    return;
   }
 
-  if (status === "left" || status === "kicked") {
-    const removed = removeChatId(ctx.chat.id);
-    if (removed) {
-      await persistSubscriptions();
-    }
-    console.log(`Removed chat ${ctx.chat.id} after leave event`);
+  await ctx.reply("Manual poll triggered. Fetching latest caps...");
+  try {
+    await runPollCycle();
+    await ctx.reply("Manual poll complete.");
+  } catch (error) {
+    console.error("Manual poll failed", error);
+    await ctx.reply("Manual poll failed. Check logs for details.");
   }
 });
 
-let running = true;
+async function editCap(address: string) {
+  const stored = announcedCaps.get(address);
+  if (stored) {
+    stored.state = "REJECTED"; // or whatever for edit
+    await persistAnnouncedAddresses();
+  }
+  // TODO: implement edit logic
+}
 
-async function pollingLoop(): Promise<void> {
-  while (running) {
-    await pollOnce();
-    await sleep(pollIntervalMs);
+async function approveCap(address: string) {
+  const stored = announcedCaps.get(address);
+  if (stored) {
+    stored.state = "APPROVED";
+    await persistAnnouncedAddresses();
+    const message = buildAlertMessage(stored.item, stored.state, stored.isEdited);
+    for (const [chatId, messageId] of Object.entries(stored.messageIds)) {
+      try {
+        await bot.telegram.editMessageText(
+          Number(chatId),
+          Number(messageId),
+          undefined,
+          message,
+          {
+            parse_mode: "HTML",
+            reply_markup: { inline_keyboard: [] },
+          }
+        );
+      } catch (error) {
+        console.error(`Failed to update approved message in chat ${chatId}`, error);
+      }
+    }
+  }
+  // TODO: implement approve logic
+}
+
+async function rejectCap(address: string) {
+  const stored = announcedCaps.get(address);
+  if (stored) {
+    stored.state = "REJECTED";
+    await persistAnnouncedAddresses();
+    const message = buildAlertMessage(stored.item, stored.state, stored.isEdited);
+    for (const [chatId, messageId] of Object.entries(stored.messageIds)) {
+      try {
+        await bot.telegram.editMessageText(
+          Number(chatId),
+          Number(messageId),
+          undefined,
+          message,
+          {
+            parse_mode: "HTML",
+            reply_markup: { inline_keyboard: [] },
+          }
+        );
+      } catch (error) {
+        console.error(`Failed to update rejected message in chat ${chatId}`, error);
+      }
+    }
+  }
+  // TODO: implement reject logic
+}
+
+let pollTimer: NodeJS.Timeout | null = null;
+let currentPollPromise: Promise<void> | null = null;
+
+function runPollCycle(): Promise<void> {
+  if (!currentPollPromise) {
+    currentPollPromise = (async () => {
+      try {
+        await pollOnce();
+      } finally {
+        currentPollPromise = null;
+      }
+    })();
+  }
+
+  return currentPollPromise;
+}
+
+function startPolling(): void {
+  console.log("Initial poll cycle starting...");
+  runPollCycle().catch((error) => {
+    console.error("Initial poll failed", error);
+  });
+
+  pollTimer = setInterval(() => {
+    runPollCycle().catch((error) => {
+      console.error("Scheduled poll failed", error);
+    });
+  }, pollIntervalMs);
+}
+
+function stopPolling(): void {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
   }
 }
 
 (async () => {
-  await loadStoredChatIds();
+  await loadAnnouncedAddresses();
   console.log("Starting admin bot...");
   console.log(`Polling ${pollUrl} every ${pollIntervalMs}ms`);
 
-  await bot.launch();
-  pollingLoop().catch((error) => {
-    console.error("Polling loop terminated unexpectedly", error);
-  });
+  bot.launch();
+  await bot.telegram.setMyCommands([
+    { command: "pulldata", description: "Trigger manual poll of new caps" },
+    { command: "subscribe", description: "Subscribe this chat to cap alerts" },
+    { command: "unsubscribe", description: "Unsubscribe this chat from cap alerts" },
+  ]);
+
+  startPolling();
 
   const me = await bot.telegram.getMe();
   console.log(`Bot username: @${me.username}`);
@@ -300,6 +707,7 @@ async function pollingLoop(): Promise<void> {
       ? `Broadcasting to ${subscribedChats.size} preset chat(s)`
       : "No preset chat subscriptions found"
   );
+  console.log("Bot setup complete. Polling started.");
 })().catch((error) => {
   console.error("Failed to start admin bot", error);
   process.exit(1);
@@ -307,14 +715,14 @@ async function pollingLoop(): Promise<void> {
 
 process.once("SIGINT", () => {
   console.log("\nSIGINT received. Stopping bot...");
-  running = false;
+  stopPolling();
   bot.stop("SIGINT");
   process.exit(0);
 });
 
 process.once("SIGTERM", () => {
   console.log("\nSIGTERM received. Stopping bot...");
-  running = false;
+  stopPolling();
   bot.stop("SIGTERM");
   process.exit(0);
 });

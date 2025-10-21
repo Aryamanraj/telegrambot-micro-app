@@ -6,8 +6,8 @@ dotenv.config();
 /* ─────────────────────────────────────────────────────────────
    1) Env
    ───────────────────────────────────────────────────────────── */
-const token = process.env.BOT_TOKEN;
-if (!token) throw new Error("🛑 BOT_TOKEN not set in .env");
+const token = process.env.TGMARKETPLACE_TEST_BOT_TOKEN;
+if (!token) throw new Error("🛑 TGMARKETPLACE_TEST_BOT_TOKEN not set in .env");
 
 const webAppUrl = process.env.WEB_APP_URL;
 if (!webAppUrl) throw new Error("🛑 WEB_APP_URL not set in .env");

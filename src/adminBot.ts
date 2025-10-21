@@ -50,6 +50,9 @@ if (!rawPollApiKey) {
 }
 const pollApiKey = rawPollApiKey;
 
+const tonApiBaseUrl = process.env.TON_API_BASE_URL ?? "https://tonapi.io/v2";
+const tonApiKey = process.env.TON_API_KEY;
+
 const pollIntervalMs = (() => {
   const fallback = 60_000;
   const raw = process.env.ADMIN_POLL_INTERVAL_MS;
@@ -83,6 +86,17 @@ const subscribedChats = new Set(staticChatIds);
 type CapState = "PARTIAL_PUBLISHED" | "PUBLISHED" | "APPROVED" | "REJECTED";
 
 type ApiRecord = Record<string, unknown>;
+
+interface BackendTransactionPayload {
+  txHash: string;
+  fromWalletAddress: string;
+  toWalletAddress: string;
+  giftId: number;
+  currency: string;
+  amount: string;
+  txType: string;
+  timeStamp: number;
+}
 
 interface StoredCap {
   item: CapSummary;
@@ -134,6 +148,61 @@ interface RawCapLogEntry {
   cap: CapSummary;
 }
 
+function tonFriendlyAddress(raw: string | null | undefined): string {
+  if (!raw) return "";
+  const trimmed = raw.trim();
+  if (!trimmed.includes(":")) {
+    return trimmed;
+  }
+
+  const [wcPart, hashPart] = trimmed.split(":");
+  if (!wcPart || !hashPart) {
+    return trimmed;
+  }
+
+  const normalizedHash = hashPart.replace(/[^0-9a-fA-F]/g, "").toLowerCase();
+  if (normalizedHash.length !== 64) {
+    return trimmed;
+  }
+
+  const workchain = Number(wcPart);
+  if (!Number.isInteger(workchain) || workchain < -128 || workchain > 127) {
+    return trimmed;
+  }
+
+  const addressBytes = Buffer.alloc(34);
+  addressBytes[0] = 0x11; // bounceable, non-bounce flag not set, non-testnet
+  addressBytes.writeInt8(workchain, 1);
+  Buffer.from(normalizedHash, "hex").copy(addressBytes, 2);
+
+  const crc = crc16(addressBytes);
+  const full = Buffer.alloc(36);
+  addressBytes.copy(full, 0);
+  full[34] = (crc >> 8) & 0xff;
+  full[35] = crc & 0xff;
+
+  return full
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function crc16(buffer: Buffer): number {
+  let crc = 0xffff;
+  for (let i = 0; i < buffer.length; i += 1) {
+    crc ^= buffer[i] << 8;
+    for (let j = 0; j < 8; j += 1) {
+      if (crc & 0x8000) {
+        crc = ((crc << 1) ^ 0x1021) & 0xffff;
+      } else {
+        crc = (crc << 1) & 0xffff;
+      }
+    }
+  }
+  return crc & 0xffff;
+}
+
 function buildActionKeyboard(capAddress: string) {
   return {
     inline_keyboard: [
@@ -174,6 +243,11 @@ const fieldSelectState = new Map<
   number,
   { address: string; selectMessageId: number; infoMessageId: number }
 >(); // chatId to selection metadata
+
+const registerFlowState = new Map<
+  number,
+  { chatId: number; promptMessageId: number; helperMessageIds: number[] }
+>();
 
 async function loadAnnouncedAddresses(): Promise<void> {
   try {
@@ -254,9 +328,67 @@ function normalizeIdentifier(value: unknown): string | number | null {
   return null;
 }
 
-async function postJson(url: string, body: unknown): Promise<ApiRecord> {
+function extractIdentifier(
+  record: ApiRecord | null,
+  keys: string[]
+): string | number | null {
+  if (!record) return null;
+
+  const visited = new Set<object>();
+
+  const visit = (candidate: any): string | number | null => {
+    if (!candidate || typeof candidate !== "object") {
+      return null;
+    }
+    if (visited.has(candidate)) {
+      return null;
+    }
+    visited.add(candidate);
+
+    for (const key of keys) {
+      if (Object.prototype.hasOwnProperty.call(candidate, key)) {
+        const value = normalizeIdentifier((candidate as any)[key]);
+        if (value !== null) {
+          return value;
+        }
+      }
+    }
+
+    for (const value of Object.values(candidate)) {
+      const nested = visit(value);
+      if (nested !== null) {
+        return nested;
+      }
+    }
+
+    return null;
+  };
+
+  const root = (record as any).data ?? record;
+  const direct = visit(root);
+  if (direct !== null) {
+    return direct;
+  }
+
+  return visit(record);
+}
+
+function isSellTransactionPending(record: ApiRecord | null): boolean {
+  if (!record) return false;
+  const data = (record as any).data ?? record;
+  if (!data || typeof data !== "object") return false;
+  const sellTransaction =
+    (data as any).SellTransaction ?? (data as any).sellTransaction ?? null;
+  return sellTransaction === null || sellTransaction === undefined;
+}
+
+async function sendJson(
+  method: "POST" | "PATCH",
+  url: string,
+  body: unknown
+): Promise<ApiRecord> {
   const response = await fetch(url, {
-    method: "POST",
+    method,
     headers: {
       accept: "application/json",
       "content-type": "application/json",
@@ -267,7 +399,9 @@ async function postJson(url: string, body: unknown): Promise<ApiRecord> {
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`POST ${url} failed with HTTP ${response.status}: ${text}`);
+    throw new Error(
+      `${method} ${url} failed with HTTP ${response.status}: ${text}`
+    );
   }
 
   try {
@@ -275,6 +409,23 @@ async function postJson(url: string, body: unknown): Promise<ApiRecord> {
   } catch (error) {
     throw new Error(`Failed to parse JSON response from ${url}`);
   }
+}
+
+async function postJson(url: string, body: unknown): Promise<ApiRecord> {
+  return sendJson("POST", url, body);
+}
+
+async function patchJson(url: string, body: unknown): Promise<ApiRecord> {
+  return sendJson("PATCH", url, body);
+}
+
+async function createBackendTransaction(
+  payload: BackendTransactionPayload
+): Promise<ApiRecord> {
+  console.log(
+    `Creating ${payload.txType} transaction record for hash ${payload.txHash}`
+  );
+  return postJson(`${backendBaseUrl}/capStr/transactions`, payload);
 }
 
 async function createTransactionRecord(cap: CapSummary): Promise<ApiRecord> {
@@ -291,10 +442,7 @@ async function createTransactionRecord(cap: CapSummary): Promise<ApiRecord> {
     timeStamp: cap.buyTime,
   };
 
-  console.log(
-    `Creating transaction record for cap ${cap.offchainGetgemsAddress}`
-  );
-  return postJson(`${backendBaseUrl}/capStr/transactions`, payload);
+  return createBackendTransaction(payload);
 }
 
 async function createCapRecord(
@@ -317,6 +465,239 @@ async function createCapRecord(
     `Creating cap record for cap ${cap.offchainGetgemsAddress} using transaction ${buyTransactionId}`
   );
   return postJson(`${backendBaseUrl}/capStr/caps`, payload);
+}
+
+async function patchCapSellTransaction(
+  capStrCapId: string | number,
+  sellTransactionId: string | number,
+  sellDate: number
+): Promise<ApiRecord> {
+  const payload = {
+    sellTransactionId,
+    sellDate,
+    capStrCapState: "SOLD",
+  };
+  console.log(
+    `Updating CapStr cap ${capStrCapId} with sell transaction ${sellTransactionId} at ${sellDate}`
+  );
+  return patchJson(
+    `${backendBaseUrl}/capStr/caps/${capStrCapId}`,
+    payload
+  );
+}
+
+interface TonTransactionDetails {
+  fromWalletAddress: string;
+  toWalletAddress: string;
+  amountNano: string;
+  timeStamp: number;
+}
+
+async function fetchTonTransactionDetails(
+  txHash: string
+): Promise<TonTransactionDetails> {
+  const base = tonApiBaseUrl.replace(/\/$/, "");
+  const url = `${base}/blockchain/transactions/${txHash}`;
+  const headers: Record<string, string> = {
+    accept: "application/json",
+  };
+  if (tonApiKey) {
+    headers.Authorization = `Bearer ${tonApiKey}`;
+  }
+
+  const response = await fetch(url, { headers });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(
+      `Ton API request failed for ${txHash} with HTTP ${response.status}: ${text}`
+    );
+  }
+
+  const payload = (await response.json()) as any;
+  const transaction = payload.transaction ?? payload;
+  const inMsg = transaction.in_msg ?? transaction.inMessage ?? null;
+  const outMsgs = (transaction.out_msgs ??
+    transaction.outMessages ??
+    []) as any[];
+
+  const fromAddress =
+    inMsg?.source?.address ??
+    inMsg?.source ??
+    transaction.account?.address ??
+    null;
+
+  const toAddressCandidate =
+    inMsg?.destination?.address ??
+    inMsg?.destination ??
+    outMsgs?.[0]?.destination?.address ??
+    outMsgs?.[0]?.destination ??
+    transaction.account?.address ??
+    null;
+
+  const resolvedFrom = fromAddress ?? toAddressCandidate;
+  const resolvedTo = toAddressCandidate ?? fromAddress;
+
+  if (!resolvedFrom || !resolvedTo) {
+    throw new Error(`Ton transaction ${txHash} missing address details`);
+  }
+
+  const friendlyFrom = tonFriendlyAddress(resolvedFrom);
+  const friendlyTo = tonFriendlyAddress(resolvedTo);
+
+  const extractValue = (
+    candidate: any,
+    seen: Set<any> = new Set()
+  ): string | null => {
+    if (candidate === null || candidate === undefined) {
+      return null;
+    }
+    if (typeof candidate === "string") {
+      const trimmed = candidate.trim();
+      return trimmed.length > 0 ? trimmed : null;
+    }
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return Math.trunc(candidate).toString();
+    }
+    if (typeof candidate !== "object") {
+      return null;
+    }
+    if (seen.has(candidate)) {
+      return null;
+    }
+    seen.add(candidate);
+
+    const directCandidates = [
+      candidate.value,
+      candidate.Value,
+      candidate.amount,
+      candidate.Amount,
+      candidate.coins,
+      candidate.Coins,
+    ];
+    for (const val of directCandidates) {
+      const extracted = extractValue(val, seen);
+      if (extracted) {
+        return extracted;
+      }
+    }
+
+    for (const value of Object.values(candidate)) {
+      const extracted = extractValue(value, seen);
+      if (extracted) {
+        return extracted;
+      }
+    }
+
+    return null;
+  };
+
+  const normalizeAmount = (raw: string | null): string | null => {
+    if (!raw) return null;
+    try {
+      const value = new BigNumber(raw);
+      if (!value.isFinite() || value.lte(0)) {
+        return null;
+      }
+      return value.integerValue(BigNumber.ROUND_FLOOR).toString(10);
+    } catch (_error) {
+      return null;
+    }
+  };
+
+  const pickNonZeroAmount = (candidates: (string | null)[]): string | null => {
+    for (const candidate of candidates) {
+      const normalized = normalizeAmount(candidate);
+      if (normalized) {
+        return normalized;
+      }
+    }
+    return null;
+  };
+
+  const amountFromIn = normalizeAmount(extractValue(inMsg));
+
+  let amountNano = amountFromIn;
+
+  const collectOutAmounts = (): string | null => {
+    if (!Array.isArray(outMsgs)) {
+      return null;
+    }
+
+    const prioritized: (string | null)[] = [];
+    const fallback: (string | null)[] = [];
+
+    for (const msg of outMsgs) {
+      const destinationRaw =
+        msg?.destination?.address ?? msg?.destination ?? null;
+      const friendlyDestination = tonFriendlyAddress(destinationRaw);
+      const sourceRaw = msg?.source?.address ?? msg?.source ?? null;
+      const friendlySource = tonFriendlyAddress(sourceRaw);
+      const valueCandidate = extractValue(msg);
+
+      if (
+        friendlyDestination === friendlyTo ||
+        friendlySource === friendlyFrom
+      ) {
+        prioritized.push(valueCandidate);
+      } else {
+        fallback.push(valueCandidate);
+      }
+    }
+
+    return pickNonZeroAmount([...prioritized, ...fallback]);
+  };
+
+  if (!amountNano) {
+    amountNano = collectOutAmounts();
+  }
+
+  if (!amountNano) {
+    amountNano = normalizeAmount(extractValue(transaction));
+  }
+
+  const timeStampRaw =
+    typeof transaction.utime === "number"
+      ? transaction.utime
+      : typeof transaction.timestamp === "number"
+      ? transaction.timestamp
+      : null;
+
+  return {
+    fromWalletAddress: friendlyFrom,
+    toWalletAddress: friendlyTo,
+    amountNano: amountNano ?? "0",
+    timeStamp: timeStampRaw !== null ? timeStampRaw * 1000 : Date.now(),
+  };
+}
+
+function findCapByGiftNumber(giftNumber: number): StoredCap | undefined {
+  const matches: StoredCap[] = [];
+  for (const stored of announcedCaps.values()) {
+    if (
+      stored.item.giftId === giftNumber ||
+      stored.item.capNumber === giftNumber
+    ) {
+      matches.push(stored);
+    }
+  }
+
+  if (matches.length === 0) {
+    return undefined;
+  }
+
+  const withCapRecord = matches.filter((stored) => stored.capStrRecord);
+  const pendingSell = withCapRecord.find((stored) =>
+    isSellTransactionPending(stored.capStrRecord)
+  );
+  if (pendingSell) {
+    return pendingSell;
+  }
+
+  if (withCapRecord.length > 0) {
+    return withCapRecord[0];
+  }
+
+  return matches[0];
 }
 
 async function pollOnce(): Promise<void> {
@@ -581,6 +962,12 @@ bot.on("callback_query", async (ctx) => {
 
 bot.on("text", async (ctx, next) => {
   const userId = ctx.from!.id;
+  const registerState = registerFlowState.get(userId);
+  if (registerState) {
+    await handleRegisterFlowMessage(ctx, registerState);
+    return;
+  }
+
   const state = editState.get(userId);
   if (state) {
     const {
@@ -653,7 +1040,9 @@ bot.on("text", async (ctx, next) => {
 bot.command("subscribe", async (ctx) => {
   const chatId = ctx.chat?.id;
   if (!chatId || !allowedChatIds.has(chatId)) {
-    await ctx.reply("Chat not authorized to subscribe.");
+    await ctx.reply(
+      `Chat not authorized to subscribe, please get this added by the bot admin: ${chatId}`
+    );
     return;
   }
   if (subscribedChats.has(chatId)) {
@@ -667,7 +1056,9 @@ bot.command("subscribe", async (ctx) => {
 bot.command("unsubscribe", async (ctx) => {
   const chatId = ctx.chat?.id;
   if (!chatId || !allowedChatIds.has(chatId)) {
-    await ctx.reply("Chat not authorized to unsubscribe.");
+    await ctx.reply(
+      `Chat not authorized to unsubscribe, please get this added by the bot admin: ${chatId}`
+    );
     return;
   }
   if (!subscribedChats.has(chatId)) {
@@ -697,6 +1088,60 @@ bot.command("pulldata", async (ctx) => {
   }
 });
 
+bot.command("registersellbuyburn", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  const userId = ctx.from?.id;
+  if (!chatId || !allowedChatIds.has(chatId)) {
+    await ctx.reply("Not authorized to register sell/buy/burn flows.");
+    return;
+  }
+  if (!userId) {
+    await ctx.reply("Unable to determine user initiating the request.");
+    return;
+  }
+
+  if (registerFlowState.has(userId)) {
+    await ctx.reply(
+      "A sell/buy/burn registration is already in progress. Please send the JSON payload or cancel the flow before starting another."
+    );
+    return;
+  }
+
+  const instructions = [
+    "Please reply with the registration payload as JSON (single message).",
+    "Required fields:",
+    "- capSellTxHash",
+    "- capstrBuyTxHash",
+    "- capstrBurnTxHash",
+    "- capstrValue in TON",
+    "- giftNumber",
+    "Send the JSON exactly as in the example below.",
+  ].join("\n");
+
+  const promptMessage = await ctx.reply(instructions);
+
+  const exampleJson = `{
+  "capSellTxHash": "<TON hash>",
+  "capstrBuyTxHash": "<CAPSTR buy hash>",
+  "capstrBurnTxHash": "<CAPSTR burn hash>",
+  "capstrValue": "1500",
+  "giftNumber": 3387
+}`;
+
+  const exampleMessage = await ctx.reply(
+    `\u0060\u0060\u0060json\n${exampleJson}\n\u0060\u0060\u0060`,
+    {
+      parse_mode: "MarkdownV2",
+    }
+  );
+
+  registerFlowState.set(userId, {
+    chatId,
+    promptMessageId: promptMessage.message_id,
+    helperMessageIds: [promptMessage.message_id, exampleMessage.message_id],
+  });
+});
+
 async function editCap(address: string) {
   const stored = announcedCaps.get(address);
   if (stored) {
@@ -704,6 +1149,215 @@ async function editCap(address: string) {
     await persistAnnouncedAddresses();
   }
   // TODO: implement edit logic
+}
+
+async function handleRegisterFlowMessage(
+  ctx: any,
+  state: { chatId: number; promptMessageId: number; helperMessageIds: number[] }
+): Promise<void> {
+  const userId = ctx.from!.id;
+  const rawText = ctx.message?.text?.trim();
+
+  if (!rawText) {
+    await ctx.reply("Please send the JSON payload as plain text.");
+    return;
+  }
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch (error) {
+    await ctx.reply("Invalid JSON. Please check the payload and try again.");
+    registerFlowState.delete(userId);
+    return;
+  }
+
+  const capSellTxHash = String(parsed.capSellTxHash ?? "").trim();
+  const capstrBuyTxHash = String(parsed.capstrBuyTxHash ?? "").trim();
+  const capstrBurnTxHash = String(parsed.capstrBurnTxHash ?? "").trim();
+  const capstrValueRaw = parsed.capstrValue;
+  const giftNumberRaw = parsed.giftNumber;
+
+  const missingFields: string[] = [];
+  if (!capSellTxHash) missingFields.push("capSellTxHash");
+  if (!capstrBuyTxHash) missingFields.push("capstrBuyTxHash");
+  if (!capstrBurnTxHash) missingFields.push("capstrBurnTxHash");
+  if (capstrValueRaw === undefined || capstrValueRaw === null)
+    missingFields.push("capstrValue");
+  if (giftNumberRaw === undefined || giftNumberRaw === null)
+    missingFields.push("giftNumber");
+
+  if (missingFields.length > 0) {
+    await ctx.reply(
+      `Missing required field(s): ${missingFields.join(
+        ", "
+      )}. Please resend the payload.`
+    );
+    registerFlowState.delete(userId);
+    return;
+  }
+
+  const giftNumber = Number(giftNumberRaw);
+  if (!Number.isFinite(giftNumber)) {
+    await ctx.reply("giftNumber must be a valid number.");
+    registerFlowState.delete(userId);
+    return;
+  }
+
+  const targetCap = findCapByGiftNumber(giftNumber);
+  if (!targetCap) {
+    await ctx.reply(
+      `Could not find an announced cap with gift number ${giftNumber}.`
+    );
+    registerFlowState.delete(userId);
+    return;
+  }
+
+  if (!targetCap.capStrRecord) {
+    await ctx.reply(
+      "CapStr record not found for this cap. Approve the cap before registering sell/buy/burn transactions."
+    );
+    registerFlowState.delete(userId);
+    return;
+  }
+
+  const giftId = targetCap.item.giftId ?? targetCap.item.capNumber;
+  if (typeof giftId !== "number") {
+    await ctx.reply(
+      "Unable to resolve giftId for this cap. Ensure the cap has been announced with a gift identifier."
+    );
+    registerFlowState.delete(userId);
+    return;
+  }
+
+  let capstrAmount: string;
+  try {
+    capstrAmount = new BigNumber(capstrValueRaw).multipliedBy(1e9).toString();
+  } catch (error) {
+    await ctx.reply("capstrValue must be numeric.");
+    return;
+  }
+
+  try {
+    const [capSellDetails, capstrBuyDetails, capstrBurnDetails] =
+      await Promise.all([
+        fetchTonTransactionDetails(capSellTxHash),
+        fetchTonTransactionDetails(capstrBuyTxHash),
+        fetchTonTransactionDetails(capstrBurnTxHash),
+      ]);
+
+    await createBackendTransaction({
+      txHash: capSellTxHash,
+      fromWalletAddress: capSellDetails.fromWalletAddress,
+      toWalletAddress: capSellDetails.toWalletAddress,
+      giftId,
+      currency: "TON",
+      amount: capSellDetails.amountNano,
+      txType: "SELL",
+      timeStamp: capSellDetails.timeStamp,
+    });
+
+    await createBackendTransaction({
+      txHash: capstrBuyTxHash,
+      fromWalletAddress: capstrBuyDetails.fromWalletAddress,
+      toWalletAddress: capstrBuyDetails.toWalletAddress,
+      giftId,
+      currency: "CAPSTR",
+      amount: capstrAmount,
+      txType: "BUY",
+      timeStamp: capstrBuyDetails.timeStamp,
+    });
+
+    const capstrBurnRecord = await createBackendTransaction({
+      txHash: capstrBurnTxHash,
+      fromWalletAddress: capstrBurnDetails.fromWalletAddress,
+      toWalletAddress: capstrBurnDetails.toWalletAddress,
+      giftId,
+      currency: "CAPSTR",
+      amount: capstrAmount,
+      txType: "BURN",
+      timeStamp: capstrBurnDetails.timeStamp,
+    });
+
+    const sellTransactionId = extractIdentifier(capstrBurnRecord, [
+      "TxID",
+      "txId",
+      "transactionId",
+      "id",
+    ]);
+
+    if (sellTransactionId === null) {
+      throw new Error(
+        "Unable to determine sell transaction identifier from burn transaction response"
+      );
+    }
+
+    const capStrCapId = extractIdentifier(targetCap.capStrRecord, [
+      "CapStrCapID",
+      "capStrCapId",
+      "id",
+    ]);
+
+    if (capStrCapId === null) {
+      throw new Error(
+        "Unable to determine CapStrCapID for this cap; cannot patch sell transaction."
+      );
+    }
+
+    const normalizedSellTransactionId =
+      typeof sellTransactionId === "string"
+        ? Number(sellTransactionId)
+        : sellTransactionId;
+    if (!Number.isFinite(normalizedSellTransactionId)) {
+      throw new Error("Sell transaction identifier is not a valid number");
+    }
+
+    const normalizedCapStrCapId =
+      typeof capStrCapId === "string" ? Number(capStrCapId) : capStrCapId;
+    if (!Number.isFinite(normalizedCapStrCapId)) {
+      throw new Error("CapStrCapID is not a valid number");
+    }
+
+    const updatedCapRecord = await patchCapSellTransaction(
+      normalizedCapStrCapId,
+      normalizedSellTransactionId,
+      capSellDetails.timeStamp
+    );
+
+    targetCap.capStrRecord = updatedCapRecord;
+    await persistAnnouncedAddresses();
+
+    registerFlowState.delete(userId);
+
+    for (const messageId of state.helperMessageIds) {
+      try {
+        await ctx.telegram.deleteMessage(state.chatId, messageId);
+      } catch (error) {
+        console.warn(
+          `Failed to delete register flow helper message ${messageId}`,
+          error
+        );
+      }
+    }
+
+    await ctx.reply(
+      [
+        "Sell/buy/burn registration complete:",
+        `- TON sell transaction: <a href="https://tonviewer.com/${capSellTxHash}">${capSellTxHash}</a>`,
+        `- CAPSTR buy transaction: <a href="https://tonviewer.com/${capstrBuyTxHash}">${capstrBuyTxHash}</a>`,
+        `- CAPSTR burn transaction: <a href="https://tonviewer.com/${capstrBurnTxHash}">${capstrBurnTxHash}</a>`,
+        `- CapStr cap updated: ${normalizedCapStrCapId}`,
+        `- Sell transaction linked: ${normalizedSellTransactionId}`,
+      ].join("\n"),
+      { parse_mode: "HTML" }
+    );
+  } catch (error) {
+    console.error("Sell/buy/burn registration failed", error);
+    await ctx.reply(
+      `Failed to register sell/buy/burn flow: ${(error as Error).message}`
+    );
+    registerFlowState.delete(userId);
+  }
 }
 
 async function approveCap(address: string) {
@@ -847,6 +1501,10 @@ function stopPolling(): void {
     {
       command: "unsubscribe",
       description: "Unsubscribe this chat from cap alerts",
+    },
+    {
+      command: "registersellbuyburn",
+      description: "Register sell/buy/burn transactions for a cap",
     },
   ]);
 

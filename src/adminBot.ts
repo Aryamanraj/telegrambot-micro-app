@@ -249,6 +249,11 @@ const registerFlowState = new Map<
   { chatId: number; promptMessageId: number; helperMessageIds: number[] }
 >();
 
+const updateGreenTextFlowState = new Map<
+  number,
+  { chatId: number; promptMessageId: number }
+>();
+
 async function loadAnnouncedAddresses(): Promise<void> {
   try {
     const raw = await fs.readFile(announcedFilePath, "utf8");
@@ -968,6 +973,12 @@ bot.on("text", async (ctx, next) => {
     return;
   }
 
+  const updateGreenTextState = updateGreenTextFlowState.get(userId);
+  if (updateGreenTextState) {
+    await handleUpdateGreenTextMessage(ctx, updateGreenTextState);
+    return;
+  }
+
   const state = editState.get(userId);
   if (state) {
     const {
@@ -1140,6 +1151,116 @@ bot.command("registersellbuyburn", async (ctx) => {
     promptMessageId: promptMessage.message_id,
     helperMessageIds: [promptMessage.message_id, exampleMessage.message_id],
   });
+});
+
+bot.command("updatecapstrategygreentext", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  const userId = ctx.from?.id;
+  if (!chatId || !allowedChatIds.has(chatId)) {
+    await ctx.reply("Not authorized to update green text.");
+    return;
+  }
+  if (!userId) {
+    await ctx.reply("Unable to determine user initiating the request.");
+    return;
+  }
+
+  if (updateGreenTextFlowState.has(userId)) {
+    await ctx.reply(
+      "A green text update is already in progress. Please send the text or cancel the flow before starting another."
+    );
+    return;
+  }
+
+  let currentText = "Unable to fetch current text";
+  try {
+    const response = await fetch(`${backendBaseUrl}/greentext/fetch/CAPSTRATEGY_FUN`, {
+      headers: {
+        accept: "application/json",
+        "x-api-key": pollApiKey,
+      },
+    });
+    if (response.ok) {
+      const data = await response.json();
+      if (data.success && data.data) {
+        currentText = data.data.Text;
+      }
+    }
+  } catch (error) {
+    console.warn("Failed to fetch current green text for prompt", error);
+  }
+
+  const promptMessage = await ctx.reply(
+    `Current green text: ${currentText}\n\nPlease reply with the new green text for CAPSTRATEGY_FUN.`
+  );
+
+  updateGreenTextFlowState.set(userId, {
+    chatId,
+    promptMessageId: promptMessage.message_id,
+  });
+});
+
+bot.command("removecapstrategygreentext", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId || !allowedChatIds.has(chatId)) {
+    await ctx.reply("Not authorized to remove green text.");
+    return;
+  }
+
+  await ctx.reply("Removing green text...");
+  try {
+    const response = await fetch(`${backendBaseUrl}/greentext/update/CAPSTRATEGY_FUN`, {
+      method: "PATCH",
+      headers: {
+        accept: "application/json",
+        "x-api-key": pollApiKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ IsOnline: false }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    await ctx.reply("Green text removed successfully.");
+  } catch (error) {
+    console.error("Failed to remove green text", error);
+    await ctx.reply("Failed to remove green text. Check logs for details.");
+  }
+});
+
+bot.command("getcapstrategygreentext", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId || !allowedChatIds.has(chatId)) {
+    await ctx.reply("Not authorized to get green text.");
+    return;
+  }
+
+  try {
+    const response = await fetch(`${backendBaseUrl}/greentext/fetch/CAPSTRATEGY_FUN`, {
+      headers: {
+        accept: "application/json",
+        "x-api-key": pollApiKey,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+    if (data.success && data.data) {
+      await ctx.reply(
+        `Current green text: ${data.data.Text}\nOnline: ${data.data.IsOnline}`
+      );
+    } else {
+      await ctx.reply("Failed to retrieve green text data.");
+    }
+  } catch (error) {
+    console.error("Failed to fetch green text", error);
+    await ctx.reply("Error fetching green text. Check logs for details.");
+  }
 });
 
 async function editCap(address: string) {
@@ -1357,6 +1478,66 @@ async function handleRegisterFlowMessage(
       `Failed to register sell/buy/burn flow: ${(error as Error).message}`
     );
     registerFlowState.delete(userId);
+  }
+}
+
+async function handleUpdateGreenTextMessage(
+  ctx: any,
+  state: { chatId: number; promptMessageId: number }
+): Promise<void> {
+  const userId = ctx.from!.id;
+  const rawText = ctx.message?.text?.trim();
+
+  if (!rawText) {
+    await ctx.reply("Please send the green text as plain text.");
+    return;
+  }
+
+  updateGreenTextFlowState.delete(userId);
+
+  try {
+    await ctx.telegram.deleteMessage(state.chatId, state.promptMessageId);
+  } catch (error) {
+    console.warn(`Failed to delete update green text prompt message`, error);
+  }
+
+  try {
+    const response = await fetch(`${backendBaseUrl}/greentext/update/CAPSTRATEGY_FUN`, {
+      method: "PATCH",
+      headers: {
+        accept: "application/json",
+        "x-api-key": pollApiKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ Text: rawText, IsOnline: true }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    await ctx.reply("Green text updated successfully.");
+
+    // Confirm by fetching the updated text
+    try {
+      const confirmResponse = await fetch(`${backendBaseUrl}/greentext/fetch/CAPSTRATEGY_FUN`, {
+        headers: {
+          accept: "application/json",
+          "x-api-key": pollApiKey,
+        },
+      });
+      if (confirmResponse.ok) {
+        const confirmData = await confirmResponse.json();
+        if (confirmData.success && confirmData.data) {
+          await ctx.reply(`Updated green text: ${confirmData.data.Text}`);
+        }
+      }
+    } catch (confirmError) {
+      console.warn("Failed to confirm updated green text", confirmError);
+    }
+  } catch (error) {
+    console.error("Failed to update green text", error);
+    await ctx.reply("Failed to update green text. Check logs for details.");
   }
 }
 

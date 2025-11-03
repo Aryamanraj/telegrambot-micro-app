@@ -27,12 +27,12 @@ type UpdateGreenTextState =
       helperMessageIds: number[];
     };
 
-function buildTargetSelectionKeyboard() {
+function buildTargetSelectionKeyboard(prefix = "greentext_target_") {
   return {
     inline_keyboard: GREEN_TEXT_TARGETS.map((target) => [
       {
         text: target.label,
-        callback_data: `greentext_target_${target.id}`,
+        callback_data: `${prefix}${target.id}`,
       },
     ]),
   };
@@ -97,6 +97,30 @@ async function updateGreenTextValue(
   }
 }
 
+async function disableGreenText(
+  backendBaseUrl: string,
+  pollApiKey: string,
+  targetId: GreenTextTargetId
+): Promise<void> {
+  const response = await fetch(
+    `${backendBaseUrl}/greentext/update/${targetId}`,
+    {
+      method: "PATCH",
+      headers: {
+        accept: "application/json",
+        "x-api-key": pollApiKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ IsOnline: false }),
+    }
+  );
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`HTTP ${response.status}: ${body}`);
+  }
+}
+
 export function setupGreenTextFlow({
   bot,
   allowedChatIds,
@@ -104,6 +128,14 @@ export function setupGreenTextFlow({
   backendBaseUrl,
 }: GreenTextFlowDeps) {
   const updateGreenTextFlowState = new Map<number, UpdateGreenTextState>();
+  const removeGreenTextFlowState = new Map<
+    number,
+    { chatId: number; helperMessageIds: number[] }
+  >();
+  const getGreenTextFlowState = new Map<
+    number,
+    { chatId: number; helperMessageIds: number[] }
+  >();
 
   async function cleanupHelperMessages(
     chatId: number,
@@ -312,72 +344,187 @@ export function setupGreenTextFlow({
     });
   });
 
-  bot.command("removecapstrategygreentext", async (ctx) => {
+  bot.command("removegreentext", async (ctx) => {
     const chatId = ctx.chat?.id;
+    const userId = ctx.from?.id;
     if (!chatId || !allowedChatIds.has(chatId)) {
       await ctx.reply("Not authorized to remove green text.");
       return;
     }
-
-    await ctx.reply("Removing green text...");
-    try {
-      const response = await fetch(
-        `${backendBaseUrl}/greentext/update/CAPSTRATEGY_FUN`,
-        {
-          method: "PATCH",
-          headers: {
-            accept: "application/json",
-            "x-api-key": pollApiKey,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ IsOnline: false }),
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      await ctx.reply("Green text removed successfully.");
-    } catch (error) {
-      console.error("Failed to remove green text", error);
-      await ctx.reply("Failed to remove green text. Check logs for details.");
+    if (!userId) {
+      await ctx.reply("Unable to determine user initiating the request.");
+      return;
     }
+
+    if (
+      removeGreenTextFlowState.has(userId) ||
+      updateGreenTextFlowState.has(userId) ||
+      getGreenTextFlowState.has(userId)
+    ) {
+      await ctx.reply(
+        "A green text action is already in progress. Please complete it before starting another."
+      );
+      return;
+    }
+
+    const selectionMessage = await ctx.reply(
+      "Which green text should be disabled?",
+      {
+        reply_markup: buildTargetSelectionKeyboard("greentext_remove_"),
+      }
+    );
+
+    removeGreenTextFlowState.set(userId, {
+      chatId,
+      helperMessageIds: [selectionMessage.message_id],
+    });
   });
 
-  bot.command("getcapstrategygreentext", async (ctx) => {
+  bot.command("getgreentext", async (ctx) => {
     const chatId = ctx.chat?.id;
+    const userId = ctx.from?.id;
     if (!chatId || !allowedChatIds.has(chatId)) {
       await ctx.reply("Not authorized to get green text.");
       return;
     }
+    if (!userId) {
+      await ctx.reply("Unable to determine user initiating the request.");
+      return;
+    }
 
+    if (
+      getGreenTextFlowState.has(userId) ||
+      updateGreenTextFlowState.has(userId) ||
+      removeGreenTextFlowState.has(userId)
+    ) {
+      await ctx.reply(
+        "A green text action is already in progress. Please complete it before starting another."
+      );
+      return;
+    }
+
+    const selectionMessage = await ctx.reply(
+      "Which green text should be fetched?",
+      {
+        reply_markup: buildTargetSelectionKeyboard("greentext_get_"),
+      }
+    );
+
+    getGreenTextFlowState.set(userId, {
+      chatId,
+      helperMessageIds: [selectionMessage.message_id],
+    });
+  });
+
+  bot.action(/^greentext_remove_(.+)$/, async (ctx) => {
+    const match = ctx.match as RegExpExecArray | undefined;
+    const targetId = match?.[1];
+    const target = targetId ? findTargetById(targetId) : undefined;
+    if (!target) {
+      await ctx.answerCbQuery("Unknown selection", { show_alert: true });
+      return;
+    }
+
+    const userId = ctx.from?.id;
+    if (!userId) {
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    const state = removeGreenTextFlowState.get(userId);
+    if (!state) {
+      await ctx.answerCbQuery("Session expired. Use /removegreentext again.", {
+        show_alert: true,
+      });
+      return;
+    }
+
+    const helperIds = new Set(state.helperMessageIds);
+    const selectionMessageId = ctx.callbackQuery.message?.message_id;
+    if (selectionMessageId) {
+      helperIds.add(selectionMessageId);
+    }
+
+    let cleaned = false;
+    await ctx.answerCbQuery(`Removing ${target.label}...`);
     try {
-      const response = await fetch(
-        `${backendBaseUrl}/greentext/fetch/CAPSTRATEGY_FUN`,
-        {
-          headers: {
-            accept: "application/json",
-            "x-api-key": pollApiKey,
-          },
-        }
+      await disableGreenText(backendBaseUrl, pollApiKey, target.id);
+      await cleanupHelperMessages(state.chatId, Array.from(helperIds));
+      cleaned = true;
+      await ctx.reply(`${target.label} green text removed successfully.`);
+    } catch (error) {
+      console.error(`Failed to remove green text for ${target.label}`, error);
+      if (!cleaned) {
+        await cleanupHelperMessages(state.chatId, Array.from(helperIds));
+        cleaned = true;
+      }
+      await ctx.reply(
+        `Failed to remove ${target.label} green text. Check logs for details.`
+      );
+    } finally {
+      removeGreenTextFlowState.delete(userId);
+    }
+  });
+
+  bot.action(/^greentext_get_(.+)$/, async (ctx) => {
+    const match = ctx.match as RegExpExecArray | undefined;
+    const targetId = match?.[1];
+    const target = targetId ? findTargetById(targetId) : undefined;
+    if (!target) {
+      await ctx.answerCbQuery("Unknown selection", { show_alert: true });
+      return;
+    }
+
+    const userId = ctx.from?.id;
+    if (!userId) {
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    const state = getGreenTextFlowState.get(userId);
+    if (!state) {
+      await ctx.answerCbQuery("Session expired. Use /getgreentext again.", {
+        show_alert: true,
+      });
+      return;
+    }
+
+    const helperIds = new Set(state.helperMessageIds);
+    const selectionMessageId = ctx.callbackQuery.message?.message_id;
+    if (selectionMessageId) {
+      helperIds.add(selectionMessageId);
+    }
+
+    let cleaned = false;
+    await ctx.answerCbQuery(`Fetching ${target.label}...`);
+    try {
+      const snapshot = await fetchGreenTextSnapshot(
+        backendBaseUrl,
+        pollApiKey,
+        target.id
       );
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
+      await cleanupHelperMessages(state.chatId, Array.from(helperIds));
+      cleaned = true;
 
-      const data = await response.json();
-      if (data.success && data.data) {
-        await ctx.reply(
-          `Current green text: ${data.data.Text}\nOnline: ${data.data.IsOnline}`
-        );
-      } else {
-        await ctx.reply("Failed to retrieve green text data.");
-      }
+      const messageLines = [
+        `Current ${target.label} green text:`,
+        snapshot.text ?? "<no text set>",
+        `Online: ${snapshot.isOnline}`,
+      ];
+
+      await ctx.reply(messageLines.join("\n"));
     } catch (error) {
-      console.error("Failed to fetch green text", error);
-      await ctx.reply("Error fetching green text. Check logs for details.");
+      console.error(`Failed to fetch green text for ${target.label}`, error);
+      if (!cleaned) {
+        await cleanupHelperMessages(state.chatId, Array.from(helperIds));
+        cleaned = true;
+      }
+      await ctx.reply(
+        `Error fetching ${target.label} green text. Check logs for details.`
+      );
+    } finally {
+      getGreenTextFlowState.delete(userId);
     }
   });
 }

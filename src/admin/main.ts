@@ -135,12 +135,12 @@ bot.action("manual_poll_PEPESTRATEGY", async (ctx) => {
       description: "Update CAPSTRATEGY_FUN or PEPESTRATEGY_FUN green text",
     },
     {
-      command: "removecapstrategygreentext",
-      description: "Disable CAPSTRATEGY_FUN green text",
+      command: "removegreentext",
+      description: "Disable green text for CapStrategy or PepeStrategy",
     },
     {
-      command: "getcapstrategygreentext",
-      description: "Display current CAPSTRATEGY_FUN green text",
+      command: "getgreentext",
+      description: "Display green text for CapStrategy or PepeStrategy",
     },
   ]);
 

@@ -1,3 +1,6 @@
+import "./admin/main";
+
+/* DO NOT REMOVE - used to run the admin bot directly
 import { promises as fs } from "fs";
 import path from "path";
 import dotenv from "dotenv";
@@ -1717,3 +1720,4 @@ process.once("SIGTERM", () => {
   bot.stop("SIGTERM");
   process.exit(0);
 });
+*/

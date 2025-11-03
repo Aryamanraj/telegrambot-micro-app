@@ -87,6 +87,146 @@ export async function fetchTonTransactionDetails(
     transaction.outMessages ??
     []) as any[];
 
+  const decodedPriorityAmounts: string[] = [];
+  const decodedFallbackAmounts: string[] = [];
+  let hasPriorityJettonAmount = false;
+
+  const considerAmountCandidate = (
+    value: unknown,
+    priority: boolean,
+    options?: { tag?: string }
+  ) => {
+    if (value === null || value === undefined) return;
+    const normalized = String(value).trim();
+    if (!normalized) return;
+    try {
+      const candidate = new BigNumber(normalized);
+      if (!candidate.isFinite() || candidate.lte(0)) return;
+      if (priority) {
+        if (!decodedPriorityAmounts.includes(candidate.toFixed(0))) {
+          decodedPriorityAmounts.push(candidate.toFixed(0));
+        }
+        if (
+          options?.tag === "amount_out" ||
+          options?.tag === "jetton_amount"
+        ) {
+          hasPriorityJettonAmount = true;
+        }
+      } else if (!decodedFallbackAmounts.includes(candidate.toFixed(0))) {
+        decodedFallbackAmounts.push(candidate.toFixed(0));
+      }
+    } catch (_error) {
+      // ignore non-numeric values
+    }
+  };
+
+  const collectDecodedAmounts = (message: any) => {
+    if (!message || typeof message !== "object") return;
+    const decoded = message.decoded_body ?? message.decodedBody;
+    if (!decoded || typeof decoded !== "object") return;
+    const opName = String(message.decoded_op_name ?? message.decodedOpName ?? "");
+    const opNameLower = opName.toLowerCase();
+    const isSwapOp = /swap/.test(opNameLower);
+    const isJettonTransferOp =
+      /jetton.*transfer/.test(opNameLower) ||
+      /internal_transfer/.test(opNameLower);
+    const isPayoutOp = /payout/.test(opNameLower);
+    const isJettonBurnOp = /jetton.*burn/.test(opNameLower) ||
+      opNameLower === "jetton_burn_notification" ||
+      (/burn/.test(opNameLower) && /jetton/.test(opNameLower));
+
+    const stack: any[] = [decoded];
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (!current || typeof current !== "object") continue;
+      for (const [key, raw] of Object.entries(current)) {
+        if (raw && typeof raw === "object") {
+          stack.push(raw);
+        }
+
+        const lowercaseKey = key.toLowerCase();
+
+        if (
+          lowercaseKey === "amount_out" ||
+          lowercaseKey === "amountout" ||
+          lowercaseKey === "amount_out_tokens" ||
+          lowercaseKey === "amountouttokens" ||
+          lowercaseKey === "amount_out_jetton" ||
+          lowercaseKey === "amountoutjetton"
+        ) {
+          considerAmountCandidate(raw, true, { tag: "amount_out" });
+        } else if (
+          lowercaseKey === "amount" &&
+          (isJettonTransferOp || isPayoutOp || isJettonBurnOp)
+        ) {
+          considerAmountCandidate(raw, true, { tag: "jetton_amount" });
+        } else if (
+          lowercaseKey === "amount" &&
+          isSwapOp
+        ) {
+          considerAmountCandidate(raw, false, { tag: "swap_amount" });
+        } else if (
+          lowercaseKey === "amount_in" ||
+          lowercaseKey === "amountin"
+        ) {
+          considerAmountCandidate(raw, false);
+        }
+      }
+    }
+  };
+
+  collectDecodedAmounts(inMsg);
+  for (const msg of outMsgs) {
+    collectDecodedAmounts(msg);
+  }
+
+  let traceAttempted = false;
+
+  const collectDecodedFromTransaction = (tx: any) => {
+    if (!tx || typeof tx !== "object") return;
+    collectDecodedAmounts(tx.in_msg ?? tx.inMessage ?? null);
+    const localOutMsgs = (tx.out_msgs ?? tx.outMessages ?? []) as any[];
+    for (const message of localOutMsgs) {
+      collectDecodedAmounts(message);
+    }
+  };
+
+  if (!hasPriorityJettonAmount) {
+    const traceUrl = `${base}/traces/${txHash.toUpperCase()}`;
+    try {
+      traceAttempted = true;
+      const traceResponse = await fetch(traceUrl, { headers });
+      if (traceResponse.ok) {
+        const tracePayload = (await traceResponse.json()) as any;
+
+        const traverseTrace = (node: any) => {
+          if (!node) return;
+          const txNode = node.transaction ?? node;
+          collectDecodedFromTransaction(txNode);
+
+          const children = node.children;
+          if (Array.isArray(children)) {
+            for (const child of children) {
+              traverseTrace(child);
+            }
+          }
+        };
+
+        traverseTrace(tracePayload);
+      }
+    } catch (_traceError) {
+      // ignore trace failures and fall back to existing candidates
+    }
+  }
+
+  console.log("[tonClient] decoded amounts", {
+    txHash,
+    priority: [...decodedPriorityAmounts],
+    fallback: [...decodedFallbackAmounts],
+    traceAttempted,
+    hasPriorityJettonAmount,
+  });
+
   const fromAddress =
     inMsg?.source?.address ??
     inMsg?.source ??
@@ -183,8 +323,6 @@ export async function fetchTonTransactionDetails(
 
   const amountFromIn = normalizeAmount(extractValue(inMsg));
 
-  let amountNano = amountFromIn;
-
   const collectOutAmounts = (): string | null => {
     if (!Array.isArray(outMsgs)) {
       return null;
@@ -214,13 +352,54 @@ export async function fetchTonTransactionDetails(
     return pickNonZeroAmount([...prioritized, ...fallback]);
   };
 
+  const amountFromDecodedPriority = pickNonZeroAmount(decodedPriorityAmounts);
+  const amountFromDecodedFallback = pickNonZeroAmount(decodedFallbackAmounts);
+
+  let amountNano: string | null = null;
+  let amountSource = "";
+
+  if (!amountNano && amountFromDecodedPriority) {
+    amountNano = amountFromDecodedPriority;
+    amountSource = "decoded_priority";
+  }
+
   if (!amountNano) {
     amountNano = collectOutAmounts();
+    if (amountNano) {
+      amountSource = "out_messages";
+    }
+  }
+
+  if (!amountNano) {
+    amountNano = amountFromDecodedFallback;
+    if (amountNano) {
+      amountSource = "decoded_fallback";
+    }
+  }
+
+  if (!amountNano) {
+    amountNano = amountFromIn;
+    if (amountNano) {
+      amountSource = "input_message";
+    }
   }
 
   if (!amountNano) {
     amountNano = normalizeAmount(extractValue(transaction));
+    if (amountNano) {
+      amountSource = "transaction";
+    }
   }
+
+  console.log("[tonClient] amount selection", {
+    txHash,
+    amountNano,
+    amountSource,
+    amountFromIn,
+    amountFromDecodedPriority,
+    amountFromDecodedFallback,
+    hasPriorityJettonAmount,
+  });
 
   const timeStampRaw =
     typeof transaction.utime === "number"

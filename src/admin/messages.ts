@@ -114,7 +114,7 @@ export function buildAlertMessage(
     `<b>GetGems URL:</b> <a href="${cap.getGemsUrl}">View on GetGems</a>`,
     `<b>Link to Gift:</b> ${
       cap.onchainAddress
-        ? `<a href="https://tonviewer.com/${cap.onchainAddress}">View on Tonviewer</a>`
+  ? `<a href="https://tonviewer.com/address/${cap.onchainAddress}">View on Tonviewer</a>`
         : "Offchain Gift"
     }`,
     "",
@@ -153,7 +153,7 @@ export function buildPepeAlertMessage(gift: PepeGiftSummary): string {
     "",
     `<b>Buy Time (UTC):</b> ${saleDate} (${gift.buyTime / 1000})`,
     `<b>GetGems URL:</b> <a href="${gift.getGemsUrl}">View on GetGems</a>`,
-    `<b>Link to Gift:</b> <a href="https://tonviewer.com/${gift.onchainAddress}">View on Tonviewer</a>`,
+  `<b>Link to Gift:</b> <a href="https://tonviewer.com/address/${gift.onchainAddress}">View on Tonviewer</a>`,
     "",
     `<b>Tx Hash:</b> <code>${gift.txHash}</code>`,
     `<b>Seller Wallet:</b> <code>${knownAddressFormatter(

@@ -275,9 +275,9 @@ Please resend the payload.`
       await ctx.reply(
         [
           "Sell/buy/burn registration complete:",
-          `- TON sell transaction: <a href="https://tonviewer.com/${capSellTxHash}">${capSellTxHash}</a>`,
-          `- CAPSTR buy transaction: <a href="https://tonviewer.com/${capstrBuyTxHash}">${capstrBuyTxHash}</a>`,
-          `- CAPSTR burn transaction: <a href="https://tonviewer.com/${capstrBurnTxHash}">${capstrBurnTxHash}</a>`,
+          `- TON sell transaction: <a href="https://tonviewer.com/transaction/${capSellTxHash}">${capSellTxHash}</a>`,
+          `- CAPSTR buy transaction: <a href="https://tonviewer.com/transaction/${capstrBuyTxHash}">${capstrBuyTxHash}</a>`,
+          `- CAPSTR burn transaction: <a href="https://tonviewer.com/transaction/${capstrBurnTxHash}">${capstrBurnTxHash}</a>`,
           `- CapStr cap updated: ${normalizedCapStrCapId}`,
           `- Sell transaction linked: ${normalizedSellTransactionId}`,
         ].join("\n"),
@@ -466,9 +466,9 @@ Please resend the payload.`
 
       const messageParts = [
         "PepeStr sell/buy/burn registration complete:",
-        `- TON sell transaction: <a href="https://tonviewer.com/${pepeSellTxHash}">${pepeSellTxHash}</a>`,
-        `- PEPESTR buy transaction: <a href="https://tonviewer.com/${pepestrBuyTxHash}">${pepestrBuyTxHash}</a>`,
-        `- PEPESTR burn transaction: <a href="https://tonviewer.com/${pepestrBurnTxHash}">${pepestrBurnTxHash}</a>`,
+  `- TON sell transaction: <a href="https://tonviewer.com/transaction/${pepeSellTxHash}">${pepeSellTxHash}</a>`,
+  `- PEPESTR buy transaction: <a href="https://tonviewer.com/transaction/${pepestrBuyTxHash}">${pepestrBuyTxHash}</a>`,
+  `- PEPESTR burn transaction: <a href="https://tonviewer.com/transaction/${pepestrBurnTxHash}">${pepestrBurnTxHash}</a>`,
         `- Gift ID: ${giftId}`,
         `- Gift number: ${giftNumber}`,
         `- PEPESTR amount (nano): ${pepestrAmount}`,

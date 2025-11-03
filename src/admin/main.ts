@@ -15,6 +15,9 @@ import { setupGreenTextFlow } from "./flows/greenText";
 import { setupSubscriptionFlow } from "./flows/subscription";
 import { setupCapManagement } from "./flows/capManagement";
 import { setupPepeManagement } from "./flows/pepeManagement";
+import { setupRegisterMultipleBuysFlow } from "./flows/registerMultipleBuys";
+import { setupRegisterMultipleSellsFlow } from "./flows/registerMultipleSells";
+import { setupRegisterMultipleBurnsFlow } from "./flows/registerMultipleBurns";
 
 const bot = new Telegraf(botToken);
 
@@ -28,6 +31,9 @@ setupGreenTextFlow({
   pollApiKey,
   backendBaseUrl,
 });
+setupRegisterMultipleBuysFlow({ bot, allowedChatIds });
+setupRegisterMultipleSellsFlow({ bot, allowedChatIds });
+setupRegisterMultipleBurnsFlow({ bot, allowedChatIds });
 setupSubscriptionFlow({ bot, allowedChatIds, subscribedChats });
 const {
   startPolling: startCapPolling,
@@ -129,6 +135,18 @@ bot.action("manual_poll_PEPESTRATEGY", async (ctx) => {
     {
       command: "registersellbuyburn",
       description: "Register transactions for CapStrategy or PepeStrategy",
+    },
+    {
+      command: "registerbuys",
+      description: "Register multiple buy transactions for CapStrategy or PepeStrategy",
+    },
+    {
+      command: "registersells",
+      description: "Register multiple sell transactions for CapStrategy or PepeStrategy",
+    },
+    {
+      command: "registerburns",
+      description: "Register multiple burn transactions for CapStrategy or PepeStrategy",
     },
     {
       command: "updategreentext",

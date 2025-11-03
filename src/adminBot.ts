@@ -843,7 +843,7 @@ function buildAlertMessage(
     `<b>GetGems URL:</b> <a href="${cap.getGemsUrl}">View on GetGems</a>`,
     `<b>Link to Gift:</b> ${
       cap.onchainAddress
-        ? `<a href="https://tonviewer.com/${cap.onchainAddress}">View on Tonviewer</a>`
+  ? `<a href="https://tonviewer.com/address/${cap.onchainAddress}">View on Tonviewer</a>`
         : "Offchain Gift"
     }`,
     "",
@@ -1467,9 +1467,9 @@ async function handleRegisterFlowMessage(
     await ctx.reply(
       [
         "Sell/buy/burn registration complete:",
-        `- TON sell transaction: <a href="https://tonviewer.com/${capSellTxHash}">${capSellTxHash}</a>`,
-        `- CAPSTR buy transaction: <a href="https://tonviewer.com/${capstrBuyTxHash}">${capstrBuyTxHash}</a>`,
-        `- CAPSTR burn transaction: <a href="https://tonviewer.com/${capstrBurnTxHash}">${capstrBurnTxHash}</a>`,
+  `- TON sell transaction: <a href="https://tonviewer.com/transaction/${capSellTxHash}">${capSellTxHash}</a>`,
+  `- CAPSTR buy transaction: <a href="https://tonviewer.com/transaction/${capstrBuyTxHash}">${capstrBuyTxHash}</a>`,
+  `- CAPSTR burn transaction: <a href="https://tonviewer.com/transaction/${capstrBurnTxHash}">${capstrBurnTxHash}</a>`,
         `- CapStr cap updated: ${normalizedCapStrCapId}`,
         `- Sell transaction linked: ${normalizedSellTransactionId}`,
       ].join("\n"),

@@ -7,6 +7,7 @@ export const editableFields = [
   "Buy Price",
   "Sale Price",
   "Buy Time (UTC)",
+  "Sale Time (UTC)",
   "GetGems URL",
   "Link to Gift",
   "Tx Hash",
@@ -21,6 +22,7 @@ export const fieldToProperty: { [key: string]: string } = {
   "Buy Price": "buyPriceTon",
   "Sale Price": "salePriceTon",
   "Buy Time (UTC)": "buyTime",
+  "Sale Time (UTC)": "saleTime",
   "GetGems URL": "getGemsUrl",
   "Link to Gift": "onchainAddress",
   "Tx Hash": "txHash",
@@ -28,7 +30,11 @@ export const fieldToProperty: { [key: string]: string } = {
   "Buyer Wallet": "toWalletAddress",
 };
 
-function saleTypeFormatter(saleType: string): string {
+function saleTypeFormatter(saleType?: string | null): string {
+  if (!saleType) {
+    return "N/A";
+  }
+
   switch (saleType.toLowerCase()) {
     case "auction":
       return "Auction";
@@ -52,6 +58,27 @@ function knownAddressFormatter(address: string): string {
     return "capstrategy.ton";
   }
   return address;
+}
+
+function formatTimestamp(timestamp?: number | null): string {
+  if (timestamp === null || timestamp === undefined) {
+    return "N/A";
+  }
+
+  if (!Number.isFinite(timestamp)) {
+    return "N/A";
+  }
+
+  try {
+    const iso = new Date(timestamp)
+      .toISOString()
+      .replace("T", " ")
+      .replace(/\.\d{3}Z$/, " UTC");
+    const epochSeconds = Math.round(timestamp / 1000);
+    return `${iso} (${epochSeconds})`;
+  } catch (_error) {
+    return "N/A";
+  }
 }
 
 export function buildActionKeyboard(capAddress: string) {
@@ -83,38 +110,58 @@ export function buildAlertMessage(
   state: CapState,
   isEdited: boolean = false
 ): string {
-  const saleDate = new Date(cap.buyTime)
-    .toISOString()
-    .replace("T", " ")
-    .replace(/\.\d{3}Z$/, " UTC");
-  let heading = "<b>🚨 New Cap Detected</b>";
   const headerLines: string[] = [];
-  if (state === "APPROVED") {
-    heading = "<b>✅ Cap Published</b>";
-    headerLines.push(
-      '<b>Live at:</b> <a href="https://capstrategy.fun">capstrategy.fun</a>'
-    );
-  } else if (state === "REJECTED") {
-    heading = "<b>⛔ Rejected Cap</b>";
-  } else if (isEdited) {
-    heading = "<b>✏️ Edited Cap</b>";
+
+  let heading: string;
+  switch (state) {
+    case "APPROVED":
+      heading = "<b>✅ Cap Published</b>";
+      headerLines.push(
+        '<b>Live at:</b> <a href="https://capstrategy.fun">capstrategy.fun</a>'
+      );
+      break;
+    case "REJECTED":
+      heading = "<b>⛔ Rejected Cap</b>";
+      break;
+    case "APPROVED_SOLD":
+    case "SOLD_APPROVED":
+      heading = "<b>💰 Cap Sold</b>";
+      headerLines.push(
+        '<b>Live at:</b> <a href="https://capstrategy.fun">capstrategy.fun</a>'
+      );
+      break;
+    case "SOLD_PUBLISHED":
+      heading = "<b>📢 Cap Sale Posted</b>";
+      break;
+    case "SOLD_REJECTED":
+      heading = "<b>⛔ Cap Sale Rejected</b>";
+      break;
+    default:
+      heading = isEdited ? "<b>✏️ Edited Cap</b>" : "<b>🚨 New Cap Detected</b>";
+      break;
   }
 
   const lines: string[] = [heading, ...headerLines, ""];
+
+  const buyPriceDisplay = cap.buyPriceTon ?? "N/A";
+  const salePriceDisplay = cap.salePriceTon ?? "N/A";
+  const buyTimeDisplay = formatTimestamp(cap.buyTime);
+  const saleTimeDisplay = formatTimestamp(cap.saleTime ?? null);
 
   lines.push(
     `<b>Getgems Address:</b> <code>${cap.offchainGetgemsAddress}</code>`,
     `<b>Name:</b> ${cap.name ?? "N/A"}`,
     "",
-    `<b>Record Type:</b> ${saleTypeFormatter(cap.saleType) ?? "N/A"}`,
-    `<b>Buy Price:</b> ${cap.buyPriceTon ?? "N/A"} TON`,
-    `<b>Sale Price:</b> ${cap.salePriceTon ?? "N/A"} TON`,
+    `<b>Record Type:</b> ${saleTypeFormatter(cap.saleType)}`,
+    `<b>Buy Price:</b> ${buyPriceDisplay} TON`,
+    `<b>Sale Price:</b> ${salePriceDisplay} TON`,
     "",
-    `<b>Buy Time (UTC):</b> ${saleDate} (${cap.buyTime / 1000})`,
+    `<b>Buy Time (UTC):</b> ${buyTimeDisplay}`,
+    `<b>Sale Time (UTC):</b> ${saleTimeDisplay}`,
     `<b>GetGems URL:</b> <a href="${cap.getGemsUrl}">View on GetGems</a>`,
     `<b>Link to Gift:</b> ${
       cap.onchainAddress
-  ? `<a href="https://tonviewer.com/address/${cap.onchainAddress}">View on Tonviewer</a>`
+        ? `<a href="https://tonviewer.com/address/${cap.onchainAddress}">View on Tonviewer</a>`
         : "Offchain Gift"
     }`,
     "",

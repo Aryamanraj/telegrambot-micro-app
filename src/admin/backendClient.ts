@@ -9,16 +9,39 @@ import {
   PepeTransactionPayload,
 } from "./types";
 
-function mapCapStateToBackend(state: CapState): "BOUGHT" | "LISTED" | "SOLD" | "ERROR" {
+function mapCapStateToBackend(
+  state: CapState
+): "BOUGHT" | "LISTED" | "SOLD" | "ERROR" {
   switch (state) {
     case "REJECTED":
+    case "SOLD_REJECTED":
       return "ERROR";
+    case "APPROVED_SOLD":
+    case "SOLD_PUBLISHED":
+    case "SOLD_APPROVED":
+      return "SOLD";
     case "PARTIAL_PUBLISHED":
+      return "BOUGHT";
     case "PUBLISHED":
     case "APPROVED":
       return "LISTED";
     default:
       return "LISTED";
+  }
+}
+
+export function tonToNano(value: string | null | undefined): string {
+  try {
+    const amount = new BigNumber(value ?? 0);
+    if (!amount.isFinite() || amount.lt(0)) {
+      return "0";
+    }
+    return amount
+      .multipliedBy(10 ** 9)
+      .integerValue(BigNumber.ROUND_FLOOR)
+      .toString(10);
+  } catch (_error) {
+    return "0";
   }
 }
 
@@ -88,11 +111,27 @@ export async function createTransactionRecord(
     toWalletAddress: cap.toWalletAddress,
     giftId: cap.giftId ?? 0,
     currency: "TON",
-    amount:
-      new BigNumber(cap.buyPriceTon).multipliedBy(10 ** 9).toString() ??
-      new BigNumber(0).toString(),
+    amount: tonToNano(cap.buyPriceTon),
     txType: "BUY",
     timeStamp: cap.buyTime,
+  };
+
+  return createBackendTransaction(payload);
+}
+
+export async function createSellTransactionRecord(
+  cap: CapSummary,
+  saleTime: number
+): Promise<ApiRecord> {
+  const payload: BackendTransactionPayload = {
+    txHash: cap.txHash,
+    fromWalletAddress: cap.fromWalletAddress,
+    toWalletAddress: cap.toWalletAddress,
+    giftId: cap.giftId ?? 0,
+    currency: "TON",
+    amount: tonToNano(cap.salePriceTon),
+    txType: "SELL",
+    timeStamp: saleTime,
   };
 
   return createBackendTransaction(payload);
@@ -106,11 +145,11 @@ export async function createCapRecord(
   const payload = {
     giftId: cap.giftId,
     url: cap.getGemsUrl,
-    boughtFor: new BigNumber(cap.buyPriceTon).multipliedBy(10 ** 9).toString(),
-    listedFor: new BigNumber(cap.salePriceTon).multipliedBy(10 ** 9).toString(),
+    boughtFor: tonToNano(cap.buyPriceTon),
+    listedFor: tonToNano(cap.salePriceTon),
     capStrCapState: mapCapStateToBackend(state),
     buyDate: cap.buyTime,
-    sellDate: null,
+    sellDate: cap.saleTime ?? null,
     buyTransactionId,
   };
 
@@ -135,6 +174,27 @@ export async function patchCapSellTransaction(
   );
   return patchJson(
     `${backendBaseUrl}/capStr/caps/${capStrCapId}`,
+    payload
+  );
+}
+
+export async function markCapAsSold(
+  giftNumber: number,
+  soldForNano: string,
+  sellDate: number,
+  sellTransactionId: string | number
+): Promise<ApiRecord> {
+  const payload = {
+    soldFor: soldForNano,
+    capStrCapState: "SOLD",
+    sellDate,
+    sellTransactionId,
+  };
+  console.log(
+    `Marking cap ${giftNumber} as sold with transaction ${sellTransactionId}`
+  );
+  return patchJson(
+    `${backendBaseUrl}/capStr/capsSold/${giftNumber}`,
     payload
   );
 }

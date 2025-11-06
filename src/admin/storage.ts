@@ -39,6 +39,12 @@ export async function loadAnnouncedCaps(): Promise<void> {
         stored.isEdited = stored.isEdited || false;
         stored.buyTransactionRecord = stored.buyTransactionRecord ?? null;
         stored.capStrRecord = stored.capStrRecord ?? null;
+        stored.sellTransactionRecord = stored.sellTransactionRecord ?? null;
+  stored.hasManualChanges = stored.hasManualChanges || false;
+        if (stored.item) {
+          (stored.item as any).saleTime =
+            (stored.item as any).saleTime ?? null;
+        }
         announcedCaps.set(stored.item.offchainGetgemsAddress, stored);
       });
     }

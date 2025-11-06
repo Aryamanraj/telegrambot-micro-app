@@ -1,15 +1,16 @@
 export interface CapSummary {
   onchainAddress: string | null;
   offchainGetgemsAddress: string;
-  name: string;
-  capNumber: number;
-  collectionAddress: string;
-  image: string;
-  saleType: string;
-  salePriceTon: string;
-  buyPriceTon: string;
+  name: string | null;
+  capNumber: number | null;
+  collectionAddress: string | null;
+  image: string | null;
+  saleType: string | null;
+  buyPriceTon: string | null;
+  salePriceTon: string | null;
   detectedAt: number;
   buyTime: number;
+  saleTime?: number | null;
   getGemsUrl: string;
   txHash: string;
   fromWalletAddress: string;
@@ -24,7 +25,9 @@ export interface PollResponse {
     ownerAddress: string;
     totalCaps: number;
     hasNew: boolean;
-    newCaps: CapSummary[];
+  newCaps: CapSummary[];
+  hasNewSales?: boolean;
+  newSales?: CapSummary[];
     seenCaps: string[];
     polledAt: number;
   };
@@ -66,7 +69,11 @@ export type CapState =
   | "PARTIAL_PUBLISHED"
   | "PUBLISHED"
   | "APPROVED"
-  | "REJECTED";
+  | "REJECTED"
+  | "APPROVED_SOLD"
+  | "SOLD_PUBLISHED"
+  | "SOLD_APPROVED"
+  | "SOLD_REJECTED";
 
 export type ApiRecord = Record<string, unknown>;
 
@@ -100,6 +107,8 @@ export interface StoredCap {
   isEdited: boolean;
   buyTransactionRecord: ApiRecord | null;
   capStrRecord: ApiRecord | null;
+  hasManualChanges?: boolean;
+  sellTransactionRecord?: ApiRecord | null;
 }
 
 export interface RawCapLogEntry {
